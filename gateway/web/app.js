@@ -1,1268 +1,1518 @@
-const $ = (sel, el = document) => el.querySelector(sel);
-const esc = (s) =>
-  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "./text-input.js";
 
-async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    credentials: "same-origin",
-    headers: opts.body ? { "content-type": "application/json", ...opts.headers } : opts.headers,
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+const app = globalThis.document?.querySelector("#app") || null;
+
+const icon = () => node("span", { class: "brand-mark", "aria-hidden": "true" }, "✦");
+
+function node(tag, attributes = {}, ...children) {
+  const element = document.createElement(tag);
+  for (const [key, value] of Object.entries(attributes)) {
+    if (key.startsWith("on") && typeof value === "function") element.addEventListener(key.slice(2).toLowerCase(), value);
+    else if (key === "class") element.className = value;
+    else if (key === "checked" || key === "disabled" || key === "required") element[key] = !!value;
+    else if (value != null) element.setAttribute(key, String(value));
+  }
+  for (const child of children.flat()) {
+    if (child == null) continue;
+    element.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return element;
+}
+
+function replace(...children) {
+  app.replaceChildren(...children);
+}
+
+async function request(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: { ...(options.body ? { "content-type": "application/json" } : {}), ...(options.headers || {}) },
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    if (res.status === 401 && state.me && path !== "/api/login" && path !== "/api/setup") {
-      state.me = null;
-      state.boot = false;
-      setHash("/login");
-    }
-    throw new Error(data.error || "出了点问题，请再试一次");
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body.error || `请求失败（${response.status}）`);
+    error.status = response.status;
+    throw error;
   }
-  return data;
+  return body;
 }
 
-const state = { me: null, desks: [], presence: {}, users: [], settings: { assist: false }, proxyPresets: [], view: "home", deskId: null, err: "", modal: false, manage: null, rename: null, create: false, setup: false, boot: true };
-
-function assistOn() {
-  return !!state.settings?.assist;
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
-function route() {
-  const h = location.hash.replace(/^#/, "") || "/";
-  if (h.startsWith("/desk/")) {
-    state.view = "desk";
-    state.deskId = h.slice("/desk/".length);
-    return;
-  }
-  state.view = h === "/admin" ? "admin" : h === "/settings" ? "settings" : h === "/login" ? "login" : "home";
+function lines(value) {
+  return String(value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
-function setHash(path) {
-  if (location.hash !== `#${path}`) location.hash = path;
-  else {
-    route();
-    render();
-  }
+function uploadFile(url, file, onProgress = () => {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "json";
+    xhr.setRequestHeader("x-gpc-file-name", encodeURIComponent(file.name));
+    xhr.setRequestHeader("content-type", file.type || "application/octet-stream");
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) onProgress(event.loaded / event.total);
+    });
+    xhr.addEventListener("load", () => {
+      const body = xhr.response || {};
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+      else reject(new Error(body.error || `上传失败（${xhr.status}）`));
+    });
+    xhr.addEventListener("error", () => reject(new Error("上传连接中断")));
+    xhr.addEventListener("abort", () => reject(new Error("上传已取消")));
+    xhr.send(file);
+  });
 }
 
-function people(id) {
-  return state.presence[id] || [];
+function field(label, input) {
+  return node("label", { class: "field" }, node("span", {}, label), input);
 }
 
-function occupancy(user) {
-  if (!user) return [];
-  const ids = [];
-  for (const [deskId, vs] of Object.entries(state.presence || {})) {
-    if ((vs || []).some((v) => v.id === user.id || v.username === user.username)) ids.push(deskId);
-  }
-  return ids;
+function textInput(name, placeholder, options = {}) {
+  return node("input", {
+    name,
+    placeholder,
+    autocomplete: options.autocomplete || "off",
+    type: options.type || "text",
+    value: options.value || "",
+    required: options.required !== false,
+  });
 }
 
-function kickBtn(id, name) {
-  return `<button type="button" class="m-kick" data-kick="${esc(id)}" data-kick-name="${esc(name)}">断开</button>`;
+function button(label, options = {}) {
+  return node(
+    "button",
+    { type: options.type || "button", class: options.class || "button", onClick: options.onClick, disabled: options.disabled },
+    label,
+  );
 }
 
-function deskName(id) {
-  return state.desks.find((d) => d.id === id)?.name || "ChatGPT";
+function message(text, kind = "error") {
+  return node("p", { class: `message ${kind}`, role: kind === "error" ? "alert" : "status" }, text);
 }
 
-function hue(name) {
-  let h = 0;
-  for (const c of String(name || "")) h = (h * 33 + c.charCodeAt(0)) >>> 0;
-  return h % 360;
+function operationProgress(label) {
+  const status = node("span", { class: "operation-progress-status" }, "等待开始");
+  const track = node(
+    "span",
+    {
+      class: "operation-progress-track",
+      role: "progressbar",
+      "aria-label": `${label}进度`,
+      "aria-valuemin": "0",
+      "aria-valuemax": "100",
+      "aria-valuenow": "0",
+    },
+    node("span", { class: "operation-progress-fill" }),
+  );
+  const element = node(
+    "div",
+    { class: "operation-progress", "data-state": "idle", role: "status", "aria-live": "polite", hidden: true },
+    node(
+      "div",
+      { class: "operation-progress-heading" },
+      node("span", { class: "operation-progress-name" }, node("span", { class: "operation-progress-icon", "aria-hidden": "true" }), label),
+      status,
+    ),
+    track,
+  );
+  const labels = { idle: "等待开始", running: "进行中", success: "完成", error: "失败" };
+  return {
+    element,
+    set(state, detail = "") {
+      element.hidden = state === "idle";
+      element.dataset.state = state;
+      status.textContent = detail ? `${labels[state]} · ${detail}` : labels[state];
+      if (state === "idle") track.setAttribute("aria-valuenow", "0");
+      else if (state === "success") track.setAttribute("aria-valuenow", "100");
+      else track.removeAttribute("aria-valuenow");
+    },
+  };
 }
 
-function av(name, cls = "av") {
-  const letter = esc(String(name || "?").slice(0, 1).toUpperCase());
-  return `<span class="${cls}" style="--h:${hue(name)}">${letter}</span>`;
-}
-
-const MARK = `<svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12.9 1.8c.5 5.9 3.4 8.8 9.3 9.3v1.8c-5.9.5-8.8 3.4-9.3 9.3h-1.8c-.5-5.9-3.4-8.8-9.3-9.3v-1.8c5.9-.5 8.8-3.4 9.3-9.3h1.8z"/></svg>`;
-
-const BLOOM = `<svg class="bloom" viewBox="0 0 41 41" aria-hidden="true"><path d="M37.5 16.7a9.3 9.3 0 0 0-1.3-8.4 9.5 9.5 0 0 0-10.2-3.6 9.5 9.5 0 0 0-7.2-5.7 9.5 9.5 0 0 0-9 4.3A9.4 9.4 0 0 0 3 8.8a9.5 9.5 0 0 0 1.1 10.8 9.4 9.4 0 0 0-1.4 8.5 9.5 9.5 0 0 0 10.2 3.6 9.5 9.5 0 0 0 7.3 5.7 9.5 9.5 0 0 0 9-4.3 9.4 9.4 0 0 0 6.7-5.5 9.5 9.5 0 0 0-1.1-10.9zm-15.3 18a7.1 7.1 0 0 1-4.6-1.7l.1-.1 6.3-3.6a1 1 0 0 0 .5-.9v-8.9l2.7 1.5a.1.1 0 0 1 .1.1v7.3a7.2 7.2 0 0 1-5.1 6.3zm-13.7-5.8a7.1 7.1 0 0 1-.9-4.8l.1.1 6.3 3.6a1 1 0 0 0 1 0l7.7-4.4v3.1a.1.1 0 0 1 0 .1l-6.4 3.7a7.2 7.2 0 0 1-7.8-1.4zm-1.8-14.8a7.1 7.1 0 0 1 3.7-3.1v.1l6.3 3.6a1 1 0 0 0 .5.9v8.9l-2.7-1.5a.1.1 0 0 1-.1-.1v-7.3a7.2 7.2 0 0 1-7.7-1.5zm27.3 3.2-6.3-3.6a1 1 0 0 0-1 0l-7.7 4.4v-3.1a.1.1 0 0 1 0-.1l6.3-3.7a7.2 7.2 0 0 1 8.7 9.3zm3.3 4.8-.1-.1-6.3-3.6a1 1 0 0 0-1 0L20.6 21v-3.1a.1.1 0 0 1 0-.1l6.4-3.6a7.2 7.2 0 0 1 2.3 10.4zM14.6 22.3l-2.7-1.6a.1.1 0 0 1-.1-.1v-7.3a7.2 7.2 0 0 1 11.8-5.5l-.1.1-6.3 3.6a1 1 0 0 0-.5.9v8.9z"/></svg>`;
-
-const ICO = {
-  back: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M15.5 5.5 9 12l6.5 6.5-1.4 1.4L6.2 12l7.9-7.9 1.4 1.4Z"/></svg>`,
-  image: `<svg class="ico-img" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm1.2 13h11.6l-3.4-4.6-2.6 3.3-2.2-2.6L6.2 17ZM8 9.2A1.6 1.6 0 1 0 8 6a1.6 1.6 0 0 0 0 3.2Z"/></svg>`,
-  share: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M14 4h6v6h-2V7.4l-7.3 7.3-1.4-1.4L16.6 6H14V4ZM6 6h5v2H7.8A1.8 1.8 0 0 0 6 9.8v6.4C6 17.2 6.8 18 7.8 18h6.4c1 0 1.8-.8 1.8-1.8V13h2v3.2A3.8 3.8 0 0 1 14.2 20H7.8A3.8 3.8 0 0 1 4 16.2V9.8A3.8 3.8 0 0 1 7.8 6H11V6H6Z"/></svg>`,
-  arrow: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M13.2 5.3 18.9 11l.9 1-.9 1-5.7 5.7-1.4-1.4 4.3-4.3H4v-2h12.1l-4.3-4.3 1.4-1.4Z"/></svg>`,
-  pencil: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M14.06 6.19l3.75 3.75L7.5 20.25H3.75V16.5L14.06 6.19Zm1.41-1.41 1.83-1.83a1 1 0 0 1 1.41 0l2.34 2.34a1 1 0 0 1 0 1.41l-1.83 1.83-3.75-3.75Z"/></svg>`,
-  plus: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"/></svg>`,
-};
-
-function greet() {
-  const h = new Date().getHours();
-  if (h < 5) return "夜深了";
-  if (h < 12) return "早上好";
-  if (h < 18) return "下午好";
-  return "晚上好";
-}
-
-function renderBoot() {
-  return `<div class="boot">${MARK}</div>`;
-}
-
-function renderLogin() {
-  return `<div class="auth">
-    <div class="auth-brand">${MARK}<span>GPT&#8209;Pro Cloud</span></div>
-    <form class="auth-card" id="login-form">
-      <h1>欢迎回来</h1>
-      <p class="hint">登录以使用团队的 ChatGPT 账号</p>
-      <div class="err" id="err">${esc(state.err)}</div>
-      <label class="field"><span>用户名</span><input name="username" autocomplete="username" autofocus required></label>
-      <label class="field"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
-      <button class="btn lg block" type="submit">登录</button>
-    </form>
-    <p class="auth-foot">账号由管理员分配，如需开通请联系管理员</p>
-  </div>`;
-}
-
-function renderSetup() {
-  return `<div class="auth">
-    <div class="auth-brand">${MARK}<span>GPT&#8209;Pro Cloud</span></div>
-    <form class="auth-card" id="setup-form">
-      <h1>创建管理员</h1>
-      <p class="hint">首次部署：设置管理员账号，之后用它登录并邀请成员</p>
-      <div class="err" id="err"></div>
-      <label class="field"><span>用户名</span><input name="username" autocomplete="off" maxlength="32" autofocus required></label>
-      <label class="field"><span>密码</span><input name="password" type="password" autocomplete="new-password" minlength="6" required></label>
-      <label class="field"><span>确认密码</span><input name="password2" type="password" autocomplete="new-password" minlength="6" required></label>
-      <button class="btn lg block" type="submit">创建并登录</button>
-    </form>
-    <p class="auth-foot">这个向导只在还没有管理员时出现</p>
-  </div>`;
-}
-
-async function onSetup(e) {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const p1 = String(fd.get("password") || "");
-  if (p1 !== String(fd.get("password2") || "")) {
-    $("#err").textContent = "两次输入的密码不一致";
-    return;
-  }
-  try {
-    const { user } = await api("/api/setup", { method: "POST", body: { username: fd.get("username"), password: p1 } });
-    state.setup = false;
-    state.me = user;
-    await refresh();
-    setHash("/");
-  } catch (err) {
-    $("#err").textContent = err.message;
-  }
-}
-
-function shell(inner) {
-  const team =
-    state.me?.role === "admin"
-      ? `<a href="#/admin" class="top-link ${state.view === "admin" ? "on" : ""}">团队</a>
-         <a href="#/settings" class="top-link ${state.view === "settings" ? "on" : ""}">设置</a>
-         <span class="top-sep"></span>`
-      : "";
-  return `<div class="app">
-    <header class="top">
-      <a href="#/" class="brand">${MARK}<span>GPT&#8209;Pro Cloud</span></a>
-      ${team}
-      <span class="top-user">${av(state.me?.username)}<b>${esc(state.me?.username)}</b></span>
-      <button type="button" class="text-btn" id="logout">退出</button>
-    </header>
-    <main class="page">${inner}</main>
-  </div>`;
+function shell(title, subtitle, content, actions = []) {
+  return node(
+    "div",
+    { class: "page-shell" },
+    node(
+      "header",
+      { class: "topbar" },
+      node("a", { class: "brand", href: "/" }, icon(), node("span", {}, "GPT Pro")),
+      actions.length ? node("nav", { class: "top-actions" }, actions) : null,
+    ),
+    node(
+      "section",
+      { class: "page-heading" },
+      node("h1", {}, title),
+      subtitle ? node("p", {}, subtitle) : null,
+    ),
+    content,
+  );
 }
 
 function renderHome() {
-  const name = esc(state.me?.username || "");
-  const head = `<header class="page-head">
-    <h1 class="display">${greet()}，${name}</h1>
-    <p class="hint">${state.desks.length ? "选择一个 ChatGPT 账号开始使用。" : "还没有可使用的账号，请联系管理员开通。"}</p>
-  </header>`;
-  const isAdmin = state.me?.role === "admin";
-  const cards = state.desks
-    .map((d) => {
-      const vs = people(d.id);
-      const live = vs.length > 0;
-      const stack = vs
-        .slice(0, 4)
-        .map((v) => av(v.username, "av mini"))
-        .join("");
-      const names = vs.map((v) => v.username).join("、");
-      const kicks = isAdmin
-        ? vs
-            .filter((v) => v.id && v.id !== state.me?.id)
-            .map((v) => kickBtn(v.id, v.username))
-            .join("")
-        : "";
-      const users = live
-        ? `<span class="m-users"><span class="stack">${stack}</span><span>${esc(names)}</span>${kicks}</span>`
-        : `<span class="m-users"><span>无人使用</span></span>`;
-      const pencil = isAdmin
-        ? `<button type="button" class="m-rename" data-rename="${esc(d.id)}" aria-label="重命名">${ICO.pencil}</button>`
-        : "";
-      const del = isAdmin && d.extra
-        ? `<button type="button" class="m-kick" data-delete="${esc(d.id)}" data-delete-name="${esc(d.name)}" data-delete-live="${live ? "1" : ""}">删除</button>`
-        : "";
-      return `<div class="machine" data-open="${esc(d.id)}" role="button" tabindex="0">
-        <span class="m-body">
-          <span class="m-head">
-            <span class="m-mark">${BLOOM}</span>
-            <span class="badge ${live ? "live" : ""}"><i class="status-dot"></i>${live ? "使用中" : "空闲"}</span>
-          </span>
-          <span class="m-name">${esc(d.name)}${pencil}</span>
-        </span>
-        <span class="m-foot">
-          ${users}
-          ${del}
-          <span class="m-go">进入${ICO.arrow}</span>
-        </span>
-      </div>`;
-    })
-    .join("");
-  const addCard = isAdmin
-    ? `<div class="machine add" data-add-desk role="button" tabindex="0">
-        <span class="m-body">
-          <span class="m-head">
-            <span class="m-mark plus">${ICO.plus}</span>
-          </span>
-          <span class="m-name">添加 ChatGPT 账号</span>
-        </span>
-        <span class="m-foot">
-          <span class="m-users"><span>启动一台新的桌面</span></span>
-          <span class="m-go">添加${ICO.arrow}</span>
-        </span>
-      </div>`
-    : "";
-  const rd = state.rename ? state.desks.find((d) => d.id === state.rename) : null;
-  const renameModal = rd
-    ? `<div class="mask" id="rename-mask">
-        <form class="sheet" id="rename-form">
-          <h2>重命名账号</h2>
-          <p class="hint">这个名字对所有成员可见。留空则恢复默认名。</p>
-          <div class="err" id="rename-err"></div>
-          <label class="field"><span>名字</span><input name="name" value="${esc(rd.name)}" maxlength="24" autofocus autocomplete="off"></label>
-          <div class="sheet-actions">
-            <button class="btn ghost" type="button" id="rename-cancel">取消</button>
-            <button class="btn" type="submit">保存</button>
-          </div>
-        </form>
-      </div>`
-    : "";
-  const createModal = state.create
-    ? `<div class="mask" id="create-mask">
-        <form class="sheet" id="create-form">
-          <h2>添加 ChatGPT 账号</h2>
-          <p class="hint">会启动一台新的 Chromium 桌面。打开新卡片后登录一次 ChatGPT，之后就能像现有账号一样分给成员。</p>
-          <div class="err" id="create-err"></div>
-          <label class="field"><span>名字</span><input name="name" maxlength="24" placeholder="例如 客户号" autofocus autocomplete="off" required></label>
-          <div class="sheet-actions">
-            <button class="btn ghost" type="button" id="create-cancel">取消</button>
-            <button class="btn" type="submit">添加</button>
-          </div>
-        </form>
-      </div>`
-    : "";
-  const grid = cards || addCard ? `<div class="machines">${cards}${addCard}</div>` : "";
-  return shell(`${head}${grid}${renameModal}${createModal}`);
-}
-
-function renderAdmin() {
-  if (state.me?.role !== "admin") return renderHome();
-  const rows = state.users
-    .map((u) => {
-      const chips = (u.desks || []).map((id) => `<span class="chip">${esc(deskName(id))}</span>`).join("");
-      const on = occupancy(u);
-      const liveChip = on.length
-        ? `<span class="chip live">${esc(on.map(deskName).join("、"))} · 使用中</span>`
-        : "";
-      const actions =
-        u.role === "admin"
-          ? ""
-          : `<button type="button" class="text-btn" data-manage="${esc(u.id)}">管理</button>
-             <button type="button" class="text-btn danger" data-del="${esc(u.id)}" data-name="${esc(u.username)}">移除</button>`;
-      const role = u.role === "admin" ? "管理员" : "成员";
-      const where = on.length ? ` · 正在使用 ${esc(on.map(deskName).join("、"))}` : "";
-      return `<article class="person ${u.disabled ? "off" : ""}">
-        <div class="person-who">${av(u.username)}<div class="person-id"><b>${esc(u.username)}</b><span>${role}${where}${u.disabled ? ` · <i class="off-note">已停用</i>` : ""}</span></div></div>
-        <div class="access">${liveChip}${chips || (liveChip ? "" : `<span class="none">未分配账号</span>`)}</div>
-        <div class="person-actions">${actions}</div>
-      </article>`;
-    })
-    .join("");
-  const checks = state.desks
-    .map((d) => `<label class="pick"><input type="checkbox" name="desks" value="${esc(d.id)}" checked> ${esc(d.name)}</label>`)
-    .join("");
-  const modal = state.modal
-    ? `<div class="mask" id="modal">
-        <form class="sheet" id="user-form">
-          <h2>邀请成员</h2>
-          <p class="hint">对方将用这个账号登录，并使用你勾选的 ChatGPT。</p>
-          <div class="err" id="err"></div>
-          <label class="field"><span>用户名</span><input name="username" autocomplete="off" required></label>
-          <label class="field"><span>密码</span><input name="password" type="password" autocomplete="new-password" required minlength="6"></label>
-          <div class="field">
-            <span>可使用</span>
-            <div class="picks">${checks}</div>
-          </div>
-          <div class="sheet-actions">
-            <button class="btn ghost" type="button" id="cancel">取消</button>
-            <button class="btn" type="submit">邀请</button>
-          </div>
-        </form>
-      </div>`
-    : "";
-  const mu = state.manage ? state.users.find((u) => u.id === state.manage) : null;
-  const manageChecks = mu
-    ? state.desks
-        .map(
-          (d) =>
-            `<label class="pick"><input type="checkbox" name="desks" value="${esc(d.id)}" ${(mu.desks || []).includes(d.id) ? "checked" : ""}> ${esc(d.name)}</label>`,
-        )
-        .join("")
-    : "";
-  const manageModal = mu
-    ? `<div class="mask" id="manage-mask">
-        <form class="sheet" id="manage-form">
-          <h2>管理成员</h2>
-          <p class="hint">调整 ${esc(mu.username)} 的账号权限与登录设置。</p>
-          <div class="err" id="manage-err"></div>
-          <div class="field">
-            <span>可使用</span>
-            <div class="picks">${manageChecks}</div>
-          </div>
-          <label class="field"><span>重置密码</span><input name="password" type="password" autocomplete="new-password" minlength="6" placeholder="留空则不修改"></label>
-          <label class="pick block-pick"><input type="checkbox" name="disabled" ${mu.disabled ? "checked" : ""}> 停用登录（已有会话立即失效）</label>
-          <div class="sheet-actions">
-            <button class="btn ghost" type="button" id="manage-cancel">取消</button>
-            <button class="btn" type="submit">保存</button>
-          </div>
-        </form>
-      </div>`
-    : "";
-  return shell(`<div class="narrow">
-    <header class="page-head split">
-      <div>
-        <h1 class="display">团队</h1>
-        <p class="hint">管理谁可以登录、能用哪些账号。谁在使用某台桌面，请到首页账号卡片上断开。</p>
-      </div>
-      <button type="button" class="btn" id="add-user">邀请成员</button>
-    </header>
-    <section class="panel">
-      <div class="people">${rows}</div>
-    </section>
-  </div>${modal}${manageModal}`);
-}
-
-function sharedProxyValue() {
-  const vals = state.desks.map((d) => d.proxy || "");
-  if (vals.length && vals.every((v) => v === vals[0])) return vals[0];
-  return state.proxyPresets[0] || "";
-}
-
-function renderSettings() {
-  if (state.me?.role !== "admin") return renderHome();
-  const on = assistOn();
-  const presets = (state.proxyPresets || [])
-    .map((u) => `<button type="button" class="chip" data-proxy-pick="${esc(u)}" title="${esc(u)}">${esc(u)}</button>`)
-    .join("");
-  const rows = state.desks
-    .map(
-      (d) => `<div class="proxy-row">
-        <div class="proxy-id"><b>${esc(d.name)}</b></div>
-        <input class="proxy-input" data-proxy-input="${esc(d.id)}" value="${esc(d.proxy || "")}" placeholder="默认出口" autocomplete="off" spellcheck="false">
-        <button type="button" class="btn ghost" data-proxy-save="${esc(d.id)}">保存</button>
-      </div>`,
-    )
-    .join("");
-  return shell(`<div class="narrow">
-    <header class="page-head">
-      <h1 class="display">设置</h1>
-      <p class="hint">对整个部署生效，仅管理员可见。</p>
-    </header>
-    <section class="panel">
-      <label class="switch-row">
-        <span>
-          <b>页面协助</b>
-          <em>打开后自动进项目，顶栏可代点分享。会连接浏览器调试口。</em>
-        </span>
-        <input type="checkbox" id="assist-toggle" ${on ? "checked" : ""}>
-      </label>
-      <div class="assist-note">
-        <b>说明</b>
-        <p><b>分享</b> — 关掉时，在 ChatGPT 页面里自己点 Share 并复制，链接会经剪贴板落到本机。打开后，顶栏多一个「分享」按钮，由网关代点，链接直接给你。</p>
-        <p><b>记忆隔离</b> — 打开后，成员第一次进入某个账号，会自动进入（或创建）一个以其用户名命名的 ChatGPT 项目，并设为仅项目内记忆。对话不读写账号的全局记忆。</p>
-        <p><b>案例</b> — ada 和 bob 共用「账号A」。ada 第一次打开时进入项目「ada」，对话只写进这个项目、不进账号的全局记忆；bob 进的是「bob」。两人仍在同一个 ChatGPT 账号里，记忆互不影响。</p>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-head">
-        <b>复制粘贴</b>
-        <em>本机和桌面之间的复制粘贴是双向的，平时无需额外操作。</em>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-head">
-        <b>出口代理</b>
-        <em>服务器能直连 ChatGPT（如海外机器）就不需要代理，留空即可；服务器在国内等无法直连的网络时必须配置。前置条件：一个服务器可达的 http:// / https:// / socks5:// 代理端点——宿主机上跑的代理客户端填 <code>http://127.0.0.1:7890</code> 这类地址即可，会自动改写为容器可达；也可以填远程代理。填一次后点「全部应用」会下发到每个 ChatGPT 账号，路径与逐行保存相同（立即重启该账号的浏览器）。保存过的地址会出现在上方，点一下就能再用。留空再应用则恢复服务器默认出口。</em>
-      </div>
-      ${presets ? `<div class="proxy-presets">${presets}</div>` : ""}
-      <div class="proxy-row all">
-        <div class="proxy-id"><b>全部账号</b></div>
-        <input class="proxy-input" id="proxy-all-input" value="${esc(sharedProxyValue())}" placeholder="应用到全部账号" autocomplete="off" spellcheck="false">
-        <button type="button" class="btn ghost" id="proxy-all">全部应用</button>
-      </div>
-      <div class="proxies">${rows}</div>
-    </section>
-  </div>`);
-}
-
-const isMac = /Mac|iPhone|iPad/.test(String(navigator.userAgent || navigator.platform || ""));
-const MOD = isMac ? "Cmd" : "Ctrl";
-let lastClip = null;
-let lastThumb = "";
-
-function clipKeys() {
-  return `<span class="clip-sep"></span><span class="clip-keys"><kbd>${MOD}+C</kbd><kbd>${MOD}+V</kbd></span>`;
-}
-
-function toast(msg, kind) {
-  let el = $("#gpc-toast");
-  if (!el) {
-    el = document.createElement("div");
-    el.id = "gpc-toast";
-    el.className = "toast";
-    document.body.appendChild(el);
-  }
-  el.innerHTML = `${kind === "image" ? ICO.image : ""}<span>${esc(msg)}</span>`;
-  el.classList.add("on");
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove("on"), 2600);
-}
-
-function setChip(kind, text) {
-  const chip = $("#clip-chip");
-  if (!chip) return;
-  chip.classList.add("show");
-  chip.classList.toggle("idle", kind === "waiting" || !kind);
-  chip.classList.toggle("busy", kind === "pasting" || kind === "copying");
-  if (kind === "image") {
-    chip.innerHTML = `${ICO.image}<span>image</span>${clipKeys()}`;
-    chip.title = "拷到本机";
-    return;
-  }
-  if (kind === "pasting") {
-    chip.innerHTML = `<i class="pulse"></i><span>pasting</span>${clipKeys()}`;
-    return;
-  }
-  if (kind === "copying") {
-    chip.innerHTML = `<i class="pulse"></i><span>copying</span>${clipKeys()}`;
-    return;
-  }
-  if (text) {
-    const one = String(text).replace(/\s+/g, " ").trim();
-    chip.innerHTML = `<span>${esc(one)}</span>${clipKeys()}`;
-    chip.title = "拷到本机";
-    return;
-  }
-  chip.innerHTML = `<i class="pulse"></i><span>waiting</span>${clipKeys()}`;
-  chip.title = `${MOD}+V 贴进来`;
-}
-
-async function writeToLocal(text, imageBlob) {
-  try {
-    if (imageBlob && navigator.clipboard?.write && window.ClipboardItem) {
-      await navigator.clipboard.write([new ClipboardItem({ [imageBlob.type || "image/png"]: imageBlob })]);
-      return true;
-    }
-    if (text && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    /* http / permission */
-  }
-  if (!text) return false;
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.setAttribute("readonly", "");
-    ta.style.cssText = "position:fixed;left:-9999px;top:0";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    const ok = document.execCommand("copy");
-    ta.remove();
-    return ok;
-  } catch {
-    return false;
-  }
-}
-
-async function copyLastToLocal() {
-  if (!lastClip) return false;
-  if (lastClip.kind === "image") {
-    const blob = new Blob([lastClip.body], { type: lastClip.mime || "image/png" });
-    return writeToLocal("", blob);
-  }
-  return writeToLocal(lastClip.text || "", null);
-}
-
-function renderDesk() {
-  const d = state.desks.find((x) => x.id === state.deskId);
-  const vs = people(state.deskId);
-  const names = vs.length ? vs.map((v) => v.username).join("、") : "";
-  const src = `/vnc/index.html?autoconnect=1&path=websockify&resize=remote&reconnect=true&reconnect_delay=2000&clipboard_up=true&clipboard_down=true&clipboard_seamless=true`;
-  return `<div class="stage">
-    <div class="chrome">
-      <a class="back" href="#/">${ICO.back}<span>退出</span></a>
-      <div class="chrome-mid">
-        ${BLOOM}
-        <span class="title">${esc(d ? d.name : "ChatGPT")}</span>
-        <span class="who" ${names ? "" : "hidden"}>${esc(names)}</span>
-      </div>
-      <div class="chrome-end">
-        ${assistOn() ? `<button type="button" class="chrome-btn" id="share-chat">${ICO.share}<span>分享</span></button>` : ""}
-        <button type="button" class="clip-chip" id="clip-chip"></button>
-      </div>
-    </div>
-    <div class="frame">
-      <div class="frame-wait" id="frame-wait">${MARK}</div>
-      <iframe src="${src}" allow="clipboard-read; clipboard-write; autoplay; microphone"></iframe>
-    </div>
-  </div>`;
-}
-
-function render() {
-  const root = $("#app");
-  if (state.boot && !state.me) {
-    root.innerHTML = renderBoot();
-    return;
-  }
-  if (state.setup && !state.me) {
-    root.innerHTML = renderSetup();
-    $("#setup-form").onsubmit = onSetup;
-    return;
-  }
-  if (state.view === "login" || !state.me) {
-    root.innerHTML = renderLogin();
-    $("#login-form").onsubmit = onLogin;
-    return;
-  }
-  if (state.view === "desk") {
-    root.innerHTML = renderDesk();
-    bindDesk();
-    return;
-  }
-  root.innerHTML = state.view === "admin" ? renderAdmin() : state.view === "settings" ? renderSettings() : renderHome();
-  bind();
-}
-
-async function onLogout(e) {
-  e?.preventDefault();
-  try {
-    await api("/api/logout", { method: "POST" });
-  } catch {
-    /* still leave */
-  }
-  state.me = null;
-  state.modal = false;
-  state.manage = null;
-  state.rename = null;
-  state.create = false;
-  setHash("/login");
-}
-
-let peekTimer = 0;
-let lastPeeked = "";
-
-function stopPeek() {
-  if (peekTimer) {
-    clearInterval(peekTimer);
-    peekTimer = 0;
-  }
-}
-
-function dropPresence() {
-  stopPeek();
-  if (!state.me) return;
-  const uid = state.me.username;
-  for (const id of Object.keys(state.presence)) {
-    state.presence[id] = (state.presence[id] || []).filter((v) => v.username !== uid);
-  }
-  api("/api/presence/leave", { method: "POST", body: {} }).catch(() => {});
-}
-
-function isShareLink(text) {
-  return /^https:\/\/chatgpt\.com\/share\/[A-Za-z0-9-]+/i.test(String(text || "").trim());
-}
-
-async function adoptDeskText(text, quiet) {
-  const t = String(text || "").trim();
-  if (!t) return false;
-  const url = isShareLink(t) ? t.split(/\s+/)[0] : t;
-  if (lastPeeked === url || lastClip?.text === url) return false;
-  lastPeeked = url;
-  lastClip = { kind: "text", body: url, mime: "text/plain; charset=utf-8", text: url, thumb: "" };
-  setChip("text", url);
-  const ok = await writeToLocal(url, null);
-  if (!quiet) {
-    toast(isShareLink(url) ? ok ? "分享链接已复制" : "链接已记下，点格子拷到本机" : ok ? "已拷到本机" : "已记下，点格子拷到本机");
-  }
-  return true;
-}
-
-function bindDesk() {
-  const wait = $("#frame-wait");
-  const iframe = $(".frame iframe");
-  if (!iframe) return;
-  const hide = () => wait?.classList.add("gone");
-  iframe.addEventListener(
-    "load",
-    () => {
-      try {
-        bindClipboard(iframe);
-      } catch {
-        /* clipboard is optional; never block the desktop */
-      }
-      setTimeout(hide, 400);
-    },
-    { once: true },
-  );
-  setTimeout(hide, 8000);
-  lastPeeked = "";
-  setChip();
-  const chip = $("#clip-chip");
-  if (chip)
-    chip.onclick = async () => {
-      if (!lastClip) {
-        toast(`${MOD}+V 贴进来`);
-        return;
-      }
-      const ok = await copyLastToLocal();
-      toast(ok ? lastClip.kind === "image" ? "图片已拷到本机" : "已拷到本机" : "没拷出去，再点一次", lastClip.kind);
-    };
-  const shareBtn = $("#share-chat");
-  if (shareBtn)
-    shareBtn.onclick = async () => {
-      if (!state.deskId) return;
-      shareBtn.disabled = true;
-      setChip("copying");
-      try {
-        const r = await fetch(`/api/desks/${state.deskId}/share`, { method: "POST", credentials: "same-origin" });
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(data.error || "分享失败");
-        if (data.url) {
-          await adoptDeskText(data.url);
-        } else {
-          setChip("waiting");
-          toast("点了分享，但还没拿到链接。再试一次，或在页面里点 Copy link");
+  document.title = "GPT Pro";
+  const input = textInput("workspace", "例如 test", { autocomplete: "off" });
+  const errorSlot = node("div");
+  const form = node(
+    "form",
+    {
+      class: "entry-form",
+      onSubmit: (event) => {
+        event.preventDefault();
+        const id = input.value.trim().toLowerCase();
+        if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(id)) {
+          errorSlot.replaceChildren(message("请输入有效的工作区 ID。"));
+          return;
         }
-      } catch (err) {
-        setChip("waiting");
-        toast(err.message || "分享失败");
-      } finally {
-        shareBtn.disabled = false;
-      }
-    };
-  if (assistOn()) ensureWorkspace();
-  stopPeek();
-  peekTimer = setInterval(async () => {
-    if (state.view !== "desk" || !state.deskId) return;
-    try {
-      const r = await fetch(`/api/desks/${state.deskId}/peek`, { credentials: "same-origin" });
-      if (r.status === 401 && state.me) {
-        state.me = null;
-        setHash("/login");
-        return;
-      }
-      if (!r.ok) return;
-      const mime = r.headers.get("content-type") || "";
-      if (!mime.startsWith("text/")) return;
-      const text = (await r.text()).trim();
-      if (isShareLink(text)) await adoptDeskText(text);
-    } catch {
-      /* ignore */
-    }
-  }, 2000);
-}
-
-async function sendDeskPaste(body, mime) {
-  const id = state.deskId;
-  if (!id) return false;
-  const r = await fetch(`/api/desks/${id}/paste`, {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "content-type": mime },
-    body,
-  });
-  return r.ok;
-}
-
-async function copyFromDesk() {
-  const id = state.deskId;
-  if (!id) return false;
-  setChip("copying");
-  const r = await fetch(`/api/desks/${id}/copy`, { method: "POST", credentials: "same-origin" });
-  if (!r.ok) {
-    setChip("waiting");
-    toast("没复制到");
-    return false;
-  }
-  const mime = r.headers.get("content-type") || "text/plain";
-  const buf = await r.arrayBuffer();
-  if (mime.startsWith("image/")) {
-    const blob = new Blob([buf], { type: mime });
-    const file = new File([blob], "image.png", { type: mime });
-    if (lastThumb) URL.revokeObjectURL(lastThumb);
-    lastThumb = URL.createObjectURL(file);
-    lastClip = { kind: "image", body: buf, mime, text: "", thumb: lastThumb };
-    setChip("image");
-    const ok = await writeToLocal("", blob);
-    toast(ok ? "图片已复制到本机" : "已记下图片，点顶栏图标拷到本机", "image");
-    return ok;
-  }
-  const text = new TextDecoder().decode(buf);
-  if (!text) {
-    setChip("waiting");
-    toast("没有选中的内容");
-    return false;
-  }
-  lastClip = { kind: "text", body: text, mime: "text/plain; charset=utf-8", text, thumb: "" };
-  setChip("text", text);
-  const ok = await writeToLocal(text, null);
-  const preview = text.replace(/\s+/g, " ").trim().slice(0, 18);
-  toast(ok ? `已复制到本机「${preview}${text.trim().length > 18 ? "…" : ""}」` : "已记下，点顶栏即可拷到本机");
-  return ok;
-}
-
-function bindClipboard(iframe) {
-  let win;
-  let doc;
-  try {
-    win = iframe.contentWindow;
-    doc = iframe.contentDocument;
-  } catch {
-    return;
-  }
-  if (!win || !doc?.documentElement || !doc.body) return;
-  if (doc.documentElement.dataset.gpcClip === "1") return;
-  doc.documentElement.dataset.gpcClip = "1";
-
-  const st = doc.createElement("style");
-  st.textContent =
-    "#noVNC_keyboardinput{width:2px!important;height:2px!important;opacity:.01!important;overflow:hidden!important;}";
-  (doc.head || doc.documentElement).appendChild(st);
-
-  const remember = (kind, body, mime, text, file) => {
-    if (lastThumb) URL.revokeObjectURL(lastThumb);
-    lastThumb = file ? URL.createObjectURL(file) : "";
-    lastClip = { kind, body, mime, text, thumb: lastThumb };
-    setChip(kind, text);
-  };
-
-  const fromClipboardEvent = async (cd) => {
-    if (!cd) return false;
-    for (const it of Array.from(cd.items || [])) {
-      if (it.kind === "file" && it.type.startsWith("image/")) {
-        const f = it.getAsFile();
-        if (!f) continue;
-        const mime = f.type || "image/png";
-        const buf = await f.arrayBuffer();
-        remember("image", buf, mime, "", f);
-        setChip("pasting");
-        toast("pasting", "image");
-        const ok = await sendDeskPaste(buf, mime);
-        if (ok) setChip("image");
-        else setChip("waiting");
-        toast(ok ? "图片已粘贴到输入框" : "图片没贴进去，点顶栏再试", "image");
-        return ok;
-      }
-    }
-    const text = cd.getData("text/plain");
-    if (text) {
-      remember("text", text, "text/plain; charset=utf-8", text, null);
-      setChip("pasting");
-      const ok = await sendDeskPaste(text, "text/plain; charset=utf-8");
-      if (ok) setChip("text", text);
-      else setChip("waiting");
-      const preview = text.replace(/\s+/g, " ").trim().slice(0, 18);
-      toast(ok ? `已粘贴「${preview}${text.trim().length > 18 ? "…" : ""}」` : "文字没贴进去");
-      return ok;
-    }
-    return false;
-  };
-
-  const isPasteChord = (e) =>
-    (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.code === "KeyV" || e.key === "v" || e.key === "V");
-  const isCopyChord = (e) =>
-    (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.code === "KeyC" || e.key === "c" || e.key === "C");
-
-  win.addEventListener(
-    "keydown",
-    (e) => {
-      if (isCopyChord(e)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        copyFromDesk().catch(() => {});
-        return;
-      }
-      if (!isPasteChord(e)) return;
-      const kb = doc.getElementById("noVNC_keyboardinput");
-      if (kb) kb.focus();
-      e.stopImmediatePropagation();
+        location.assign(`/w/${encodeURIComponent(id)}/`);
+      },
     },
-    true,
+    field("工作区 ID", input),
+    button("进入工作区", { type: "submit" }),
+    errorSlot,
   );
-
-  const onPaste = (e) => {
-    if (state.view !== "desk" || !e.clipboardData) return;
-    e.preventDefault();
-    e.stopPropagation();
-    fromClipboardEvent(e.clipboardData).catch(() => {});
-  };
-  win.addEventListener("paste", onPaste, true);
-  document.addEventListener("paste", onPaste, true);
-
-  let pendingLocal = "";
-  const takeRemote = (text) => {
-    if (!text || lastClip?.text === text) return;
-    pendingLocal = text;
-    remember("text", text, "text/plain; charset=utf-8", text, null);
-    navigator.clipboard?.writeText(text).catch(() => {});
-  };
-  win.addEventListener(
-    "pointerdown",
-    () => {
-      if (!pendingLocal) return;
-      const t = pendingLocal;
-      pendingLocal = "";
-      const tmp = doc.createElement("textarea");
-      tmp.value = t;
-      tmp.style.cssText = "position:fixed;left:-9999px";
-      doc.body.appendChild(tmp);
-      tmp.select();
-      doc.execCommand("copy");
-      tmp.remove();
-    },
-    true,
-  );
-
-  const hookRfb = () => {
-    const rfb = win.UI?.rfb;
-    if (!rfb || rfb._gpcHooked) return;
-    rfb._gpcHooked = true;
-    try {
-      rfb.clipboardUp = true;
-      rfb.clipboardDown = true;
-    } catch {
-      /* ignore */
-    }
-    try {
-      rfb.addEventListener("clipboard", (ev) => takeRemote(ev.detail?.text || ""));
-    } catch {
-      /* ignore */
-    }
-  };
-  hookRfb();
-  const iv = setInterval(hookRfb, 400);
-  setTimeout(() => clearInterval(iv), 20000);
+  const content = node("section", { class: "card" }, form);
+  replace(shell("打开工作区", "", content));
+  input.focus();
 }
 
-const workspaceBusy = new Set();
-
-async function ensureWorkspace() {
-  const id = state.deskId;
-  const key = `${state.me?.id || ""}:${id || ""}`;
-  if (!id || !state.me || workspaceBusy.has(key)) return;
-  workspaceBusy.add(key);
-  try {
-    for (let i = 0; i < 12; i++) {
-      if (state.view !== "desk" || state.deskId !== id) return;
-      try {
-        const r = await api(`/api/desks/${id}/onboard`, { method: "POST" });
-        if (state.me) {
-          state.me.projectDesks = { ...(state.me.projectDesks || {}), [id]: true };
-          state.me.projectReady = true;
-          state.me.projectName = r.name || state.me.username;
-        }
-        return;
-      } catch {
-        await new Promise((r) => setTimeout(r, 2500));
-      }
-    }
-  } finally {
-    workspaceBusy.delete(key);
-  }
-}
-
-async function openDesk(id) {
-  await api(`/api/desks/${id}/open`, { method: "POST" });
-  setHash(`/desk/${id}`);
-}
-
-async function onKick(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  const btn = e.currentTarget;
-  const id = btn.getAttribute("data-kick");
-  const name = btn.getAttribute("data-kick-name") || "这位成员";
-  if (!id) return;
-  if (!confirm(`确定断开 ${name} 的会话？对方需要重新登录。`)) return;
-  try {
-    await api(`/api/admin/users/${id}/kick`, { method: "POST" });
-    toast(`已断开 ${name}`);
-    await refresh();
-  } catch (err) {
-    toast(err.message || "未能断开");
-  }
-}
-
-function bindKick() {
-  document.querySelectorAll("[data-kick]").forEach((btn) => {
-    btn.onclick = onKick;
+function renderAuth({ admin = false, setup = false, workspace = null }) {
+  document.title = admin ? "GPT Pro" : workspace.name;
+  const username = textInput("username", "用户名", { autocomplete: "username" });
+  const password = textInput("password", setup ? "非空密码" : "密码", {
+    type: "password",
+    autocomplete: setup ? "new-password" : "current-password",
   });
-}
-
-async function onDeleteDesk(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  const btn = e.currentTarget;
-  const id = btn.getAttribute("data-delete");
-  const name = btn.getAttribute("data-delete-name") || "这个账号";
-  if (!id) return;
-  const live = btn.getAttribute("data-delete-live") === "1";
-  const warn = live ? "当前有人正在使用，删除后对方会断开。" : "";
-  if (!confirm(`确定删除「${name}」？该桌面会被拆除，上面的 ChatGPT 登录态一并清除。${warn}`)) return;
-  try {
-    await api(`/api/admin/desks/${id}`, { method: "DELETE" });
-    toast(`已删除 ${name}`);
-    if (state.deskId === id) setHash("/");
-    await refresh();
-  } catch (err) {
-    toast(err.message || "未能删除");
-  }
-}
-
-function bind() {
-  const logout = $("#logout");
-  if (logout) logout.onclick = onLogout;
-  bindKick();
-  document.querySelectorAll("[data-delete]").forEach((btn) => {
-    btn.onclick = onDeleteDesk;
-  });
-  document.querySelectorAll("[data-open]").forEach((btn) => {
-    btn.onclick = (e) => {
-      if (e.target.closest("[data-kick],[data-delete]")) return;
-      openDesk(btn.getAttribute("data-open"));
-    };
-    btn.onkeydown = (e) => {
-      if (e.key === "Enter" && e.target === btn) openDesk(btn.getAttribute("data-open"));
-    };
-  });
-  document.querySelectorAll("[data-add-desk]").forEach((btn) => {
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      state.create = true;
-      render();
-    };
-    btn.onkeydown = (e) => {
-      if (e.key === "Enter" && e.target === btn) {
-        state.create = true;
-        render();
-      }
-    };
-  });
-  const cCancel = $("#create-cancel");
-  if (cCancel)
-    cCancel.onclick = () => {
-      state.create = false;
-      render();
-    };
-  const cMask = $("#create-mask");
-  if (cMask)
-    cMask.onclick = (e) => {
-      if (e.target === cMask) {
-        state.create = false;
-        render();
-      }
-    };
-  const cForm = $("#create-form");
-  if (cForm)
-    cForm.onsubmit = async (e) => {
-      e.preventDefault();
-      const fd = new FormData(cForm);
-      const submit = cForm.querySelector("[type=submit]");
-      if (submit) {
+  const feedback = node("div");
+  const submit = button(setup ? "创建管理员" : "登录", { type: "submit" });
+  const endpoint = admin ? (setup ? "/admin/setup" : "/admin/login") : `/w/${workspace.id}/login`;
+  const form = node(
+    "form",
+    {
+      class: "auth-form",
+      onSubmit: async (event) => {
+        event.preventDefault();
+        feedback.replaceChildren();
         submit.disabled = true;
-        submit.textContent = "正在启动…";
-      }
-      try {
-        await api("/api/admin/desks", { method: "POST", body: { name: fd.get("name") } });
-        state.create = false;
-        toast("新账号已启动，打开卡片登录 ChatGPT");
-        await refresh();
-      } catch (err) {
-        const box = $("#create-err");
-        if (box) box.textContent = err.message;
-        if (submit) {
+        try {
+          await request(endpoint, {
+            method: "POST",
+            body: JSON.stringify({ username: username.value, password: password.value }),
+          });
+          location.reload();
+        } catch (error) {
+          feedback.replaceChildren(message(error.message));
           submit.disabled = false;
-          submit.textContent = "添加";
         }
-      }
-    };
-  const add = $("#add-user");
-  if (add)
-    add.onclick = () => {
-      state.modal = true;
-      render();
-    };
-  const cancel = $("#cancel");
-  if (cancel)
-    cancel.onclick = () => {
-      state.modal = false;
-      render();
-    };
-  const mask = $("#modal");
-  if (mask)
-    mask.onclick = (e) => {
-      if (e.target === mask) {
-        state.modal = false;
-        render();
-      }
-    };
-  const form = $("#user-form");
-  if (form)
-    form.onsubmit = async (e) => {
-      e.preventDefault();
-      const fd = new FormData(form);
-      try {
-        await api("/api/admin/users", {
-          method: "POST",
-          body: { username: fd.get("username"), password: fd.get("password"), desks: fd.getAll("desks") },
-        });
-        state.modal = false;
-        await refresh();
-      } catch (err) {
-        $("#err").textContent = err.message;
-      }
-    };
-  document.querySelectorAll("[data-rename]").forEach((btn) => {
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      state.rename = btn.getAttribute("data-rename");
-      render();
-    };
-  });
-  const rCancel = $("#rename-cancel");
-  if (rCancel)
-    rCancel.onclick = () => {
-      state.rename = null;
-      render();
-    };
-  const rMask = $("#rename-mask");
-  if (rMask)
-    rMask.onclick = (e) => {
-      if (e.target === rMask) {
-        state.rename = null;
-        render();
-      }
-    };
-  const rForm = $("#rename-form");
-  if (rForm)
-    rForm.onsubmit = async (e) => {
-      e.preventDefault();
-      const fd = new FormData(rForm);
-      try {
-        await api(`/api/admin/desks/${state.rename}`, { method: "PATCH", body: { name: fd.get("name") } });
-        state.rename = null;
-        await refresh();
-      } catch (err) {
-        $("#rename-err").textContent = err.message;
-      }
-    };
-  document.querySelectorAll("[data-manage]").forEach((btn) => {
-    btn.onclick = () => {
-      state.manage = btn.getAttribute("data-manage");
-      render();
-    };
-  });
-  const mCancel = $("#manage-cancel");
-  if (mCancel)
-    mCancel.onclick = () => {
-      state.manage = null;
-      render();
-    };
-  const mMask = $("#manage-mask");
-  if (mMask)
-    mMask.onclick = (e) => {
-      if (e.target === mMask) {
-        state.manage = null;
-        render();
-      }
-    };
-  const mForm = $("#manage-form");
-  if (mForm)
-    mForm.onsubmit = async (e) => {
-      e.preventDefault();
-      const fd = new FormData(mForm);
-      const body = { desks: fd.getAll("desks"), disabled: fd.get("disabled") === "on" };
-      const pw = String(fd.get("password") || "");
-      if (pw) body.password = pw;
-      try {
-        await api(`/api/admin/users/${state.manage}`, { method: "PATCH", body });
-        state.manage = null;
-        await refresh();
-      } catch (err) {
-        $("#manage-err").textContent = err.message;
-      }
-    };
-  document.querySelectorAll("[data-del]").forEach((btn) => {
-    btn.onclick = async () => {
-      const name = btn.getAttribute("data-name") || "这位成员";
-      if (!confirm(`确定移除 ${name}？对方将无法再登录。`)) return;
-      await api(`/api/admin/users/${btn.getAttribute("data-del")}`, { method: "DELETE" });
-      await refresh();
-    };
-  });
-  document.querySelectorAll("[data-proxy-pick]").forEach((btn) => {
-    btn.onclick = () => {
-      const url = btn.getAttribute("data-proxy-pick") || "";
-      const all = $("#proxy-all-input");
-      if (all) all.value = url;
-      document.querySelectorAll("[data-proxy-input]").forEach((input) => {
-        input.value = url;
+      },
+    },
+    field("用户名", username),
+    field("密码", password),
+    submit,
+    feedback,
+  );
+  const title = setup ? "初始化管理员" : admin ? "管理员登录" : workspace.name;
+  const subtitle = setup ? "请先在可信内网完成初始化，再开放远程入口。" : "";
+  replace(
+    shell(
+      title,
+      subtitle,
+      node("section", { class: "card auth-card" }, form),
+      admin ? [] : [node("a", { class: "text-link", href: "/" }, "其它工作区")],
+    ),
+  );
+  username.focus();
+}
+
+async function renderAdmin() {
+  document.title = "GPT Pro";
+  let bootstrap;
+  try {
+    bootstrap = await request("/admin/api/bootstrap");
+  } catch (error) {
+    replace(message(error.message));
+    return;
+  }
+  if (!bootstrap.authenticated) {
+    renderAuth({ admin: true, setup: bootstrap.setupNeeded });
+    return;
+  }
+
+  const state = await request("/admin/api/state");
+  const feedback = node("div", { class: "global-feedback" });
+  const show = (text, kind = "error") => feedback.replaceChildren(message(text, kind));
+  const refresh = () => renderAdmin().catch((error) => replace(message(error.message)));
+
+  const profile = state.browserProfile;
+  const profileTimezone = textInput("timezone", "例如 Asia/Shanghai", { value: profile.timezone });
+  const profileLocale = textInput("locale", "例如 zh-CN", { value: profile.locale });
+  const saveProfile = button("保存并应用", { class: "button small" });
+  const detectProfile = button("按出口 IP 重新探测", { class: "button small ghost" });
+  const verifyProfile = button("核验当前页面", { class: "button small ghost" });
+  saveProfile.addEventListener("click", async () => {
+    saveProfile.disabled = true;
+    try {
+      const result = await request("/admin/api/browser-profile", {
+        method: "PATCH",
+        body: JSON.stringify({ timezone: profileTimezone.value, locale: profileLocale.value }),
       });
-    };
-  });
-  document.querySelectorAll("[data-proxy-save]").forEach((btn) => {
-    btn.onclick = async () => {
-      const id = btn.getAttribute("data-proxy-save");
-      const input = document.querySelector(`[data-proxy-input="${CSS.escape(id)}"]`);
-      if (!input) return;
-      btn.disabled = true;
-      try {
-        await api(`/api/admin/desks/${id}`, { method: "PATCH", body: { proxy: input.value } });
-        toast(input.value.trim() ? "代理已更新，该账号浏览器正在重启" : "已恢复默认出口，该账号浏览器正在重启");
-        await refresh();
-      } catch (err) {
-        toast(err.message || "没保存成功");
-        if (String(err.message || "").includes("已保存")) await refresh();
-        else btn.disabled = false;
-      }
-    };
-  });
-  const proxyAll = $("#proxy-all");
-  if (proxyAll)
-    proxyAll.onclick = async () => {
-      const input = $("#proxy-all-input");
-      if (!input) return;
-      proxyAll.disabled = true;
-      try {
-        await api("/api/admin/proxies", { method: "POST", body: { proxy: input.value } });
-        toast(input.value.trim() ? "已应用到全部账号，各浏览器正在重启" : "已恢复全部账号的默认出口，浏览器正在重启");
-        await refresh();
-      } catch (err) {
-        toast(err.message || "没保存成功");
-        if (String(err.message || "").includes("已保存")) await refresh();
-        else proxyAll.disabled = false;
-      }
-    };
-  const assist = $("#assist-toggle");
-  if (assist)
-    assist.onchange = async () => {
-      assist.disabled = true;
-      try {
-        const r = await api("/api/admin/settings", { method: "POST", body: { assist: assist.checked } });
-        state.settings = r.settings || { assist: assist.checked };
-      } catch (err) {
-        assist.checked = assistOn();
-        toast(err.message || "没能保存");
-      } finally {
-        assist.disabled = false;
-      }
-    };
-}
-
-async function onLogin(e) {
-  e.preventDefault();
-  state.err = "";
-  const fd = new FormData(e.target);
-  try {
-    const { user } = await api("/api/login", {
-      method: "POST",
-      body: { username: fd.get("username"), password: fd.get("password") },
-    });
-    state.me = user;
-    await refresh();
-    setHash("/");
-  } catch (err) {
-    state.err = err.message;
-    render();
-  }
-}
-
-async function refresh() {
-  const [me, desks, presence] = await Promise.all([api("/api/me"), api("/api/desks"), api("/api/presence")]);
-  state.me = me.user;
-  state.settings = me.settings || { assist: false };
-  state.desks = desks.desks;
-  state.proxyPresets = desks.proxyPresets || [];
-  state.presence = presence.presence || {};
-  if (state.me.role === "admin") state.users = (await api("/api/admin/users")).users;
-  state.boot = false;
-  render();
-}
-
-async function tick() {
-  if (!state.me) return;
-  try {
-    if (state.view === "desk" && state.deskId) {
-      const r = await api("/api/presence/beat", { method: "POST", body: { deskId: state.deskId } });
-      state.presence[state.deskId] = r.viewers || [];
-      const who = $(".who");
-      if (who) {
-        const names = (r.viewers || []).map((v) => v.username).join("、");
-        who.textContent = names;
-        who.hidden = !names;
-      }
-    } else if (!state.modal && !state.manage && !state.rename && !state.create) {
-      const r = await api("/api/presence");
-      state.presence = r.presence || {};
-      if (state.view === "home" || state.view === "admin") render();
+      show(
+        result.runtimePending
+          ? "设置已保存；未连接的页面会在恢复后自动应用。"
+          : `已统一应用到 ${result.runtime.appliedTargets} 个浏览器页面并刷新。`,
+        "success",
+      );
+      setTimeout(refresh, 700);
+    } catch (error) {
+      show(error.message);
+      saveProfile.disabled = false;
     }
-  } catch {
-    /* ignore */
-  }
-}
+  });
+  detectProfile.addEventListener("click", async () => {
+    detectProfile.disabled = true;
+    try {
+      const result = await request("/admin/api/browser-profile/detect", { method: "POST" });
+      show(
+        result.detected
+          ? `已按 Chromium 实际出口自动设置 ${result.profile.timezone} / ${result.profile.locale}。`
+          : result.warning,
+        result.detected ? "success" : "error",
+      );
+      setTimeout(refresh, result.detected ? 700 : 1400);
+    } catch (error) {
+      show(error.message);
+      detectProfile.disabled = false;
+    }
+  });
+  verifyProfile.addEventListener("click", async () => {
+    verifyProfile.disabled = true;
+    try {
+      const result = await request("/admin/api/browser-profile/verify");
+      show(
+        result.consistent
+          ? `已核验 ${result.matchingPages}/${result.pages} 个页面：时区、locale、语言列表和 Client Hints 一致。`
+          : `仅 ${result.matchingPages}/${result.pages} 个页面与持久化设置一致，请重新保存或检查 Chromium 连接。`,
+        result.consistent ? "success" : "error",
+      );
+    } catch (error) {
+      show(error.message);
+    } finally {
+      verifyProfile.disabled = false;
+    }
+  });
+  const profileSources = {
+    ip: "Chromium 出口 IP 自动探测",
+    environment: "部署环境值",
+    manual: "管理员手动设置",
+    unset: "尚未设置",
+  };
+  const profileMeta = profile.configured
+    ? `来源：${profileSources[profile.source] || profile.source} · 语言列表：${profile.languages.join(", ")} · Accept-Language：${profile.acceptLanguage}`
+    : "首次启动会自动探测；失败时使用部署环境值。";
+  const profilePanel = node(
+    "section",
+    { class: "admin-section" },
+    node("h2", {}, "浏览器环境"),
+    node(
+      "p",
+      { class: "muted" },
+      "应用于所有工作区和管理员浏览器，保存后统一刷新。",
+    ),
+    node(
+      "article",
+      { class: "item-card" },
+      node("div", { class: "form-grid" }, field("IANA 时区", profileTimezone), field("BCP 47 浏览器语言", profileLocale)),
+      node("p", { class: "muted compact" }, profileMeta),
+      profile.detectedAt
+        ? node("p", { class: "muted compact" }, `上次自动探测：${new Date(profile.detectedAt).toLocaleString()}`)
+        : null,
+      profile.lastDetectionError ? message(profile.lastDetectionError) : null,
+      node("div", { class: "row-actions" }, saveProfile, detectProfile, verifyProfile),
+    ),
+  );
 
-window.addEventListener("hashchange", () => {
-  const leavingDesk = state.view === "desk" && !location.hash.replace(/^#/, "").startsWith("/desk/");
-  route();
-  if (leavingDesk) dropPresence();
-  render();
-});
+  const composerTools = node(
+    "textarea",
+    { rows: "7", spellcheck: "false" },
+    state.composerToolAllowlist.join("\n"),
+  );
+  const saveComposerTools = button("保存并应用白名单", { class: "button small" });
+  saveComposerTools.addEventListener("click", async () => {
+    saveComposerTools.disabled = true;
+    try {
+      const result = await request("/admin/api/composer-tools", {
+        method: "PATCH",
+        body: JSON.stringify({ names: lines(composerTools.value) }),
+      });
+      show(
+        result.runtimePending
+          ? "白名单已保存；未连接页面会在恢复后自动应用。"
+          : `白名单已应用到 ${result.runtime.appliedTargets} 个普通工作区 Target。`,
+        "success",
+      );
+      setTimeout(refresh, 700);
+    } catch (error) {
+      show(error.message);
+      saveComposerTools.disabled = false;
+    }
+  });
+  const composerToolsPanel = node(
+    "section",
+    { class: "admin-section" },
+    node("h2", {}, "普通工作区 @ / + 功能白名单"),
+    node(
+      "p",
+      { class: "muted" },
+      "按完整功能名匹配；未列出的功能不可用。Sources 只保留 Upload 与 Text input。",
+    ),
+    node(
+      "article",
+      { class: "item-card" },
+      field("允许的完整功能名（每行一项，不区分大小写）", composerTools),
+      node("div", { class: "row-actions" }, saveComposerTools),
+    ),
+  );
 
-(async function boot() {
-  route();
-  render();
-  try {
-    const s = await api("/api/setup");
-    if (s.needed) {
-      state.setup = true;
-      state.boot = false;
-      render();
-      setInterval(tick, 5000);
+  const policy = state.sensitivePolicy;
+  const policyEnabled = node("input", { type: "checkbox", checked: policy.enabled });
+  const actionPatterns = node("textarea", { rows: "10", spellcheck: "false" }, policy.actionPatterns.join("\n"));
+  const urlPatterns = node("textarea", { rows: "7", spellcheck: "false" }, policy.urlPatterns.join("\n"));
+  const savePolicy = button("保存并应用黑名单", { class: "button small" });
+  savePolicy.addEventListener("click", async () => {
+    savePolicy.disabled = true;
+    try {
+      const result = await request("/admin/api/sensitive-policy", {
+        method: "PATCH",
+        body: JSON.stringify({
+          enabled: policyEnabled.checked,
+          actionPatterns: lines(actionPatterns.value),
+          urlPatterns: lines(urlPatterns.value),
+        }),
+      });
+      show(
+        result.runtimePending
+          ? "黑名单已保存；未连接页面会在恢复后自动应用。"
+          : `黑名单已应用到 ${result.runtime.appliedTargets} 个普通工作区 Target。`,
+        "success",
+      );
+      setTimeout(refresh, 700);
+    } catch (error) {
+      show(error.message);
+      savePolicy.disabled = false;
+    }
+  });
+  const policyPanel = node(
+    "section",
+    { class: "admin-section" },
+    node("h2", {}, "普通工作区敏感操作黑名单"),
+    node(
+      "p",
+      { class: "muted" },
+      "命中项会在普通工作区隐藏并拦截；管理员浏览器不受影响。",
+    ),
+    node(
+      "article",
+      { class: "item-card" },
+      node("label", { class: "check policy-toggle" }, policyEnabled, node("span", {}, "启用普通工作区黑名单")),
+      node(
+        "div",
+        { class: "form-grid policy-grid" },
+        field("页面操作文字或可访问名称（每行一条，不区分大小写）", actionPatterns),
+        field("网络 URL 通配规则（每行一条，* 表示任意字符）", urlPatterns),
+      ),
+      node("div", { class: "row-actions" }, savePolicy),
+    ),
+  );
+
+  const projectImportList = node("div", { class: "project-import-list" });
+  const projectImportSummary = node("span", { class: "item-summary-meta" });
+  const projectImportResults = node(
+    "details",
+    { class: "item-card item-details project-import-results", hidden: true },
+    node(
+      "summary",
+      {},
+      node("span", { class: "item-summary-main" }, node("strong", {}, "Projects")),
+      projectImportSummary,
+    ),
+    node("div", { class: "item-details-body" }, projectImportList),
+  );
+  const importProjects = button("导入所选", { class: "button small", disabled: true });
+  const readProjects = button("读取 Projects", { class: "button small ghost" });
+  const readProgress = operationProgress("读取 Projects");
+  const importProgress = operationProgress("导入所选");
+  const updateImportButton = () => {
+    importProjects.disabled = !projectImportList.querySelector('input[type="checkbox"]:checked:not(:disabled)');
+  };
+  const renderProjectImports = (projects) => {
+    projectImportList.replaceChildren();
+    projectImportResults.hidden = false;
+    projectImportResults.open = false;
+    projectImportSummary.textContent = `${projects.length} 个 · 可导入 ${projects.filter((project) => project.status === "ready").length} 个`;
+    const statusLabels = {
+      ready: "可导入",
+      imported: "已存在",
+      conflict: "冲突",
+      invalid: "不可导入",
+    };
+    for (const project of projects) {
+      const checkbox = node("input", {
+        type: "checkbox",
+        "data-project-id": project.projectId,
+        "aria-label": `选择 ${project.name || "未命名 Project"}`,
+        checked: project.status === "ready",
+        disabled: project.status !== "ready",
+      });
+      checkbox.addEventListener("change", updateImportButton);
+      projectImportList.append(
+        node(
+          "label",
+          { class: "project-import-row" },
+          checkbox,
+          node(
+            "span",
+            { class: "project-import-main" },
+            node("strong", {}, project.name || "未命名 Project"),
+            project.workspaceId ? node("code", {}, `/w/${project.workspaceId}/`) : null,
+            ["conflict", "invalid"].includes(project.status)
+              ? node("p", { class: "muted compact" }, project.reason)
+              : null,
+          ),
+          node("span", { class: `badge project-import-status ${project.status}` }, statusLabels[project.status]),
+        ),
+      );
+    }
+    if (!projects.length) projectImportList.append(node("p", { class: "muted" }, "未找到可导入的 Project。"));
+    updateImportButton();
+  };
+  readProjects.addEventListener("click", async () => {
+    readProjects.disabled = true;
+    importProjects.disabled = true;
+    feedback.replaceChildren();
+    readProgress.set("running");
+    try {
+      const result = await request("/admin/api/chatgpt-projects");
+      renderProjectImports(result.projects);
+      readProgress.set("success", `${result.projects.length} 个`);
+    } catch (error) {
+      projectImportList.replaceChildren();
+      projectImportResults.hidden = true;
+      readProgress.set("error");
+      show(error.message);
+    } finally {
+      readProjects.disabled = false;
+    }
+  });
+  importProjects.addEventListener("click", async () => {
+    const projectIds = [...projectImportList.querySelectorAll('input[type="checkbox"]:checked:not(:disabled)')]
+      .map((input) => input.dataset.projectId);
+    if (!projectIds.length) return;
+    importProjects.disabled = true;
+    feedback.replaceChildren();
+    importProgress.set("running");
+    try {
+      const result = await request("/admin/api/chatgpt-projects/import", {
+        method: "POST",
+        body: JSON.stringify({ projectIds }),
+      });
+      importProgress.set("success", `${result.imported.workspaces.length} 个`);
+      show(
+        result.runtimePending
+          ? `已导入 ${result.imported.workspaces.length} 个工作区，浏览器恢复后会自动打开。`
+          : `已导入 ${result.imported.workspaces.length} 个工作区和用户。`,
+        "success",
+      );
+      setTimeout(refresh, 1000);
+    } catch (error) {
+      importProgress.set("error");
+      show(error.message);
+      updateImportButton();
+    }
+  });
+  const projectImportPanel = node(
+    "section",
+    { class: "admin-section" },
+    node("h2", {}, "导入 Projects"),
+    node("p", { class: "muted" }, "用户名和初始密码均使用项目名。"),
+    node("div", { class: "row-actions" }, readProjects, importProjects),
+    node("div", { class: "project-operation-progress" }, readProgress.element, importProgress.element),
+    projectImportResults,
+  );
+
+  const adminUploadInput = node("input", { type: "file", multiple: true, class: "hidden-file-input" });
+  const adminUpload = button("上传到远端文件区", { class: "button small" });
+  adminUpload.addEventListener("click", () => adminUploadInput.click());
+  adminUploadInput.addEventListener("change", async () => {
+    const files = [...adminUploadInput.files];
+    adminUploadInput.value = "";
+    if (!files.length) return;
+    if (files.length > 10) {
+      show("一次最多选择 10 个文件");
       return;
     }
-  } catch {
-    /* 网关旧版本没有这个接口时按已初始化处理 */
+    adminUpload.disabled = true;
+    try {
+      let last;
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        if (state.transferLimits && file.size > state.transferLimits.maxFileBytes) {
+          throw new Error(`${file.name} 超过单文件上限 ${formatBytes(state.transferLimits.maxFileBytes)}`);
+        }
+        last = await uploadFile("/admin/api/uploads", file, (progress) => {
+          show(`正在上传 ${index + 1}/${files.length}：${file.name} · ${Math.round(progress * 100)}%`, "success");
+        });
+      }
+      show(
+        `已上传 ${files.length} 个文件。最后一个远端路径：${last.file.remotePath}`,
+        "success",
+      );
+      setTimeout(refresh, 900);
+    } catch (error) {
+      show(error.message);
+      adminUpload.disabled = false;
+    }
+  });
+  const transferList = node("div", { class: "stack admin-item-list transfer-list" });
+  for (const file of state.transfers) {
+    const remove = button("删除", { class: "button small danger" });
+    remove.addEventListener("click", async () => {
+      if (!confirm(`删除文件“${file.name}”？`)) return;
+      remove.disabled = true;
+      try {
+        await request(`/admin/api/transfers/${file.id}`, { method: "DELETE" });
+        refresh();
+      } catch (error) {
+        show(error.message);
+        remove.disabled = false;
+      }
+    });
+    transferList.append(
+      node(
+        "details",
+        { class: "item-card item-details transfer-item" },
+        node(
+          "summary",
+          {},
+          node(
+            "span",
+            { class: "item-summary-main" },
+            node("strong", {}, file.name),
+            node("span", { class: "badge" }, file.kind === "upload" ? "上传暂存" : "远端下载"),
+          ),
+          node("span", { class: "item-summary-meta" }, `${formatBytes(file.size || file.receivedBytes)} · ${file.state}`),
+        ),
+        node(
+          "div",
+          { class: "item-details-body" },
+          file.remotePath ? node("code", { class: "remote-path" }, file.remotePath) : null,
+          file.kind === "download" && file.state === "ready"
+            ? node("div", { class: "row-actions" }, node("a", { class: "button small", href: `/admin/files/${file.id}` }, "保存到本机"), remove)
+            : node("div", { class: "row-actions" }, remove),
+        ),
+      ),
+    );
   }
+  if (!state.transfers.length) transferList.append(node("p", { class: "muted" }, "暂无暂存上传或远端下载。"));
+  const transferPanel = node(
+    "section",
+    { class: "admin-section" },
+    node("h2", {}, "文件传输"),
+    node(
+      "p",
+      { class: "muted" },
+      state.transferLimits
+        ? `单文件上限 ${formatBytes(state.transferLimits.maxFileBytes)}，总容量 ${formatBytes(state.transferLimits.quotaBytes)}。`
+        : "当前部署没有启用文件传输。",
+    ),
+    node("div", { class: "row-actions" }, adminUpload, adminUploadInput),
+    transferList,
+  );
+
+  const workspaceList = node("div", { class: "stack admin-item-list" });
+  for (const workspace of state.workspaces) {
+    const name = textInput("name", "名称", { value: workspace.name });
+    const startUrl = textInput("startUrl", "https://chatgpt.com/…", { value: workspace.startUrl });
+    const save = button("保存", { class: "button small" });
+    const remove = button("删除", { class: "button small danger" });
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const result = await request(`/admin/api/workspaces/${workspace.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ name: name.value, startUrl: startUrl.value }),
+        });
+        show(result.runtimePending ? "配置已保存，浏览器恢复后会自动应用。" : "工作区已更新。", "success");
+        refresh();
+      } catch (error) {
+        show(error.message);
+        save.disabled = false;
+      }
+    });
+    remove.addEventListener("click", async () => {
+      if (!confirm(`删除工作区“${workspace.name}”？对应 Target 会关闭，用户授权也会移除。`)) return;
+      remove.disabled = true;
+      try {
+        await request(`/admin/api/workspaces/${workspace.id}`, { method: "DELETE" });
+        refresh();
+      } catch (error) {
+        show(error.message);
+        remove.disabled = false;
+      }
+    });
+    workspaceList.append(
+      node(
+        "details",
+        { class: "item-card item-details" },
+        node(
+          "summary",
+          {},
+          node(
+            "span",
+            { class: "item-summary-main" },
+            node("strong", {}, workspace.name),
+            node("code", {}, workspace.id),
+          ),
+        ),
+        node(
+          "div",
+          { class: "item-details-body" },
+          node("div", { class: "form-grid" }, field("名称", name), field("起始 / 项目地址", startUrl)),
+          workspace.lastUrl && workspace.lastUrl !== workspace.startUrl
+            ? node("p", { class: "muted compact" }, `最后页面：${workspace.lastUrl}`)
+            : null,
+          node(
+            "div",
+            { class: "row-actions" },
+            node("a", { class: "button small ghost", href: `/w/${workspace.id}/`, target: "_blank", rel: "noopener" }, "打开"),
+            save,
+            remove,
+          ),
+        ),
+      ),
+    );
+  }
+
+  const newWorkspaceId = textInput("id", "例如 test");
+  const newWorkspaceName = textInput("name", "例如 测试");
+  const newWorkspaceUrl = textInput("startUrl", "https://chatgpt.com/", { value: "https://chatgpt.com/" });
+  const createWorkspace = node(
+    "form",
+    {
+      class: "inline-create workspace-create",
+      onSubmit: async (event) => {
+        event.preventDefault();
+        const submit = event.submitter;
+        submit.disabled = true;
+        try {
+          await request("/admin/api/workspaces", {
+            method: "POST",
+            body: JSON.stringify({
+              id: newWorkspaceId.value,
+              name: newWorkspaceName.value,
+              startUrl: newWorkspaceUrl.value,
+            }),
+          });
+          refresh();
+        } catch (error) {
+          show(error.message);
+          submit.disabled = false;
+        }
+      },
+    },
+    field("工作区 ID", newWorkspaceId),
+    field("显示名称", newWorkspaceName),
+    field("ChatGPT 项目地址", newWorkspaceUrl),
+    button("新增工作区", { type: "submit" }),
+  );
+
+  const userList = node("div", { class: "stack admin-item-list" });
+  for (const user of state.users) {
+    const assignments = node("div", { class: "checks" });
+    for (const workspace of state.workspaces) {
+      const checkbox = node("input", {
+        type: "checkbox",
+        value: workspace.id,
+        checked: user.role === "admin" || user.workspaceIds.includes(workspace.id),
+        disabled: user.role === "admin",
+      });
+      assignments.append(node("label", { class: "check" }, checkbox, node("span", {}, workspace.name)));
+    }
+    const password = textInput("password", "留空则不修改", { type: "password", required: false, autocomplete: "new-password" });
+    const disabled = node("input", { type: "checkbox", checked: user.disabled, disabled: user.role === "admin" });
+    const save = button(user.role === "admin" ? "更新密码" : "保存权限", { class: "button small" });
+    const kick = button("断开会话", { class: "button small ghost" });
+    const remove = button("删除用户", { class: "button small danger", disabled: user.role === "admin" });
+    save.addEventListener("click", async () => {
+      const workspaceIds = [...assignments.querySelectorAll("input:checked")].map((input) => input.value);
+      const body = user.role === "admin" ? {} : { workspaceIds, disabled: disabled.checked };
+      if (password.value) body.password = password.value;
+      if (user.role === "admin" && !body.password) {
+        show("请输入新的管理员密码。");
+        return;
+      }
+      save.disabled = true;
+      try {
+        await request(`/admin/api/users/${user.id}`, { method: "PATCH", body: JSON.stringify(body) });
+        show(user.role === "admin" ? "管理员密码已更新，请重新登录。" : "用户权限已保存，旧会话已撤销。", "success");
+        if (user.role === "admin") setTimeout(refresh, 700);
+        else refresh();
+      } catch (error) {
+        show(error.message);
+        save.disabled = false;
+      }
+    });
+    kick.addEventListener("click", async () => {
+      try {
+        const result = await request(`/admin/api/users/${user.id}/kick`, { method: "POST" });
+        show(`已撤销 ${result.sessions} 个会话并断开 ${result.sockets} 个窗口。`, "success");
+      } catch (error) {
+        show(error.message);
+      }
+    });
+    remove.addEventListener("click", async () => {
+      if (!confirm(`删除用户“${user.username}”？`)) return;
+      try {
+        await request(`/admin/api/users/${user.id}`, { method: "DELETE" });
+        refresh();
+      } catch (error) {
+        show(error.message);
+      }
+    });
+    userList.append(
+      node(
+        "details",
+        { class: "item-card item-details" },
+        node(
+          "summary",
+          {},
+          node(
+            "span",
+            { class: "item-summary-main" },
+            node("strong", {}, user.username),
+            node("span", { class: "badge" }, user.role === "admin" ? "管理员" : user.disabled ? "已停用" : "用户"),
+          ),
+          node(
+            "span",
+            { class: "item-summary-meta" },
+            `${user.role === "admin" ? state.workspaces.length : user.workspaceIds.length} 个工作区`,
+          ),
+        ),
+        node(
+          "div",
+          { class: "item-details-body" },
+          node("label", { class: "check" }, disabled, node("span", {}, "停用")),
+          node("p", { class: "label-line" }, "可访问工作区"),
+          assignments,
+          field("新密码", password),
+          node("div", { class: "row-actions" }, save, kick, remove),
+        ),
+      ),
+    );
+  }
+
+  const newUsername = textInput("username", "用户名", { autocomplete: "off" });
+  const newPassword = textInput("password", "非空密码", { type: "password", autocomplete: "new-password" });
+  const newAssignments = node("div", { class: "checks" });
+  for (const workspace of state.workspaces) {
+    newAssignments.append(
+      node(
+        "label",
+        { class: "check" },
+        node("input", { type: "checkbox", value: workspace.id }),
+        node("span", {}, workspace.name),
+      ),
+    );
+  }
+  const createUser = node(
+    "form",
+    {
+      class: "inline-create user-create",
+      onSubmit: async (event) => {
+        event.preventDefault();
+        const submit = event.submitter;
+        submit.disabled = true;
+        const workspaceIds = [...newAssignments.querySelectorAll("input:checked")].map((input) => input.value);
+        try {
+          await request("/admin/api/users", {
+            method: "POST",
+            body: JSON.stringify({ username: newUsername.value, password: newPassword.value, workspaceIds }),
+          });
+          refresh();
+        } catch (error) {
+          show(error.message);
+          submit.disabled = false;
+        }
+      },
+    },
+    field("用户名", newUsername),
+    field("密码", newPassword),
+    node("div", { class: "field wide" }, node("span", {}, "初始权限"), newAssignments),
+    button("新增用户", { type: "submit" }),
+  );
+
+  const logout = button("登出", {
+    class: "button small ghost",
+    onClick: async () => {
+      try {
+        await request("/admin/logout", { method: "POST" });
+        location.reload();
+      } catch (error) {
+        show(error.message);
+      }
+    },
+  });
+  const browserState = state.browser.connected
+    ? "浏览器已连接"
+    : "浏览器正在连接";
+  const systemPanel = node(
+    "section",
+    { class: "admin-system-panel" },
+    node(
+      "div",
+      { class: "admin-system-state" },
+      node("span", { class: state.browser.connected ? "dot online" : "dot" }),
+      node(
+        "div",
+        { class: "admin-system-copy" },
+        node("strong", {}, browserState),
+        node(
+          "span",
+          { class: "admin-system-metrics" },
+          node("span", {}, `工作区 ${state.browser.targets}/${state.browser.workspaces}`),
+          node("span", {}, `在线窗口 ${state.browser.viewers}`),
+        ),
+      ),
+    ),
+    node(
+      "div",
+      { class: "admin-system-actions" },
+      node(
+        "a",
+        { class: "button small", href: "/admin/maintenance/", target: "_blank", rel: "noopener" },
+        "打开管理员浏览器",
+      ),
+      logout,
+    ),
+  );
+  const content = node(
+    "div",
+    { class: "admin-layout" },
+    feedback,
+    systemPanel,
+    projectImportPanel,
+    profilePanel,
+    composerToolsPanel,
+    policyPanel,
+    node("section", { class: "admin-section" }, node("h2", {}, "工作区"), createWorkspace, workspaceList),
+    node("section", { class: "admin-section" }, node("h2", {}, "用户与密码"), createUser, userList),
+    transferPanel,
+  );
+  replace(shell("管理", "", content));
+}
+
+function pointerButton(number) {
+  return ["left", "middle", "right", "back", "forward"][number] || "none";
+}
+
+function pressedPointerButton(buttons) {
+  if (buttons & 1) return "left";
+  if (buttons & 2) return "right";
+  if (buttons & 4) return "middle";
+  if (buttons & 8) return "back";
+  if (buttons & 16) return "forward";
+  return "none";
+}
+
+function renderViewer(workspace, fileTransfer = { enabled: false }) {
+  document.title = workspace.name;
+  const macOS = navigator.platform === "MacIntel";
+  let socket;
+  let intentionalClose = false;
+  let reconnects = 0;
+  let viewport = { width: 1440, height: 900 };
+  let drawingFrame = false;
+  let pendingFrame = null;
+  let controlPanel;
+  let menuToggle;
+  let transferPanel;
+  let confirmSelection;
+  let fileSelection = { active: false, mode: "selectSingle" };
+  const selectedUploadIds = new Set();
+  let pointerSequence = 0;
+  let pointerDown = false;
+  let pointerEditable = null;
+  let setPanelOpen = () => {};
+  const statusText = node("span", { class: "viewer-status-text" }, "正在连接…");
+  const status = node(
+    "span",
+    { class: "viewer-status", role: "status", "aria-live": "polite", title: "正在连接…" },
+    node("span", { class: "viewer-status-icon", "aria-hidden": "true" }),
+    statusText,
+  );
+  const canvas = node("canvas", { class: "screen", width: viewport.width, height: viewport.height, tabindex: "0" });
+  const stage = node("div", { class: "screen-stage" }, canvas);
+  const keyCapture = node("textarea", {
+    class: "key-capture",
+    "aria-label": "键盘输入",
+    autocapitalize: "off",
+    autocomplete: "off",
+    inputmode: "text",
+    spellcheck: "false",
+  });
+  const context = canvas.getContext("2d", { alpha: false });
+  context.fillStyle = "#f7f7f7";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  const send = (payload) => {
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  };
+  const nativeInput = attachNativeTextInput({
+    input: keyCapture,
+    commitText: (text) => send({ type: "text", text }),
+  });
+
+  const sendViewerState = () => {
+    send({
+      type: "viewerState",
+      visible: document.visibilityState === "visible",
+      focused: document.visibilityState === "visible" && document.hasFocus(),
+    });
+  };
+
+  const setStatus = (text, state = "") => {
+    statusText.textContent = text;
+    status.dataset.state = state;
+    status.title = text;
+    if (menuToggle) {
+      menuToggle.dataset.state = state;
+      menuToggle.title = text;
+    }
+    if (state === "error" && controlPanel && (!transferPanel || transferPanel.hidden)) setPanelOpen(true);
+  };
+
+  const drawNewestFrame = async (blob) => {
+    pendingFrame = blob;
+    if (drawingFrame) return;
+    drawingFrame = true;
+    try {
+      while (pendingFrame) {
+        const current = pendingFrame;
+        pendingFrame = null;
+        const bitmap = await createImageBitmap(current);
+        context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+      }
+    } catch {
+      setStatus("画面解码失败，等待下一帧…", "error");
+    } finally {
+      drawingFrame = false;
+    }
+  };
+
+  const connect = () => {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${protocol}//${location.host}/w/${workspace.id}/socket`);
+    socket.binaryType = "blob";
+    socket.addEventListener("open", () => {
+      reconnects = 0;
+      setStatus("已连接", "online");
+      const rect = stage.getBoundingClientRect();
+      send({ type: "resize", width: Math.round(rect.width), height: Math.round(rect.height) });
+      sendViewerState();
+    });
+    socket.addEventListener("message", async (event) => {
+      if (typeof event.data === "string") {
+        const payload = JSON.parse(event.data);
+        if (payload.type === "viewport") {
+          viewport = { width: payload.width, height: payload.height };
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+        } else if (payload.type === "status") {
+          const labels = { connected: "已连接", connecting: "正在连接浏览器…", reconnecting: "浏览器重连中…" };
+          setStatus(payload.message || labels[payload.state] || payload.state, payload.state === "connected" ? "online" : "");
+        } else if (payload.type === "error") {
+          if (confirmSelection && fileSelection.active) confirmSelection.disabled = !selectedUploadIds.size;
+          setStatus(payload.message || "输入失败", "error");
+        } else if (payload.type === "policy-blocked") {
+          setStatus(payload.message || "敏感操作已拦截", "error");
+        } else if (payload.type === "file-chooser") {
+          fileSelection = {
+            active: true,
+            mode: payload.mode === "selectMultiple" ? "selectMultiple" : "selectSingle",
+          };
+          selectedUploadIds.clear();
+          setStatus("请选择私人文件");
+          openTransferPanel(true).catch((error) => setStatus(error.message, "error"));
+        } else if (payload.type === "files-selected") {
+          fileSelection.active = false;
+          selectedUploadIds.clear();
+          transferPanel.hidden = true;
+          setStatus(`已选择：${payload.files.map((file) => file.name).join("、")}`, "online");
+          if (pointerEditable === true) nativeInput.focus();
+        } else if (payload.type === "download") {
+          refreshTransfers().catch((error) => setStatus(error.message, "error"));
+        } else if (payload.type === "clipboard") {
+          if (!nativeInput.copyClipboardText(payload.text)) setStatus("本机浏览器拒绝写入剪贴板", "error");
+        } else if (payload.type === "selection") {
+          nativeInput.setSelectionText(payload.text);
+        } else if (payload.type === "input-target" && payload.sequence === pointerSequence) {
+          pointerEditable = payload.editable === true;
+          if (!pointerDown) {
+            if (pointerEditable === true) nativeInput.focus();
+            else nativeInput.blur();
+          }
+        }
+        return;
+      }
+      drawNewestFrame(event.data);
+    });
+    socket.addEventListener("close", async () => {
+      if (intentionalClose) return;
+      setStatus("连接中断，正在重试…", "error");
+      reconnects += 1;
+      if (reconnects >= 3) {
+        try {
+          const bootstrap = await request(`/w/${workspace.id}/api/bootstrap`);
+          if (!bootstrap.authenticated) {
+            location.reload();
+            return;
+          }
+        } catch (error) {
+          setStatus(`连接中断，状态检查失败：${error.message}`, "error");
+        }
+      }
+      setTimeout(connect, Math.min(5000, 700 * reconnects));
+    });
+    socket.addEventListener("error", () => socket.close());
+  };
+
+  document.addEventListener("visibilitychange", sendViewerState);
+  window.addEventListener("focus", sendViewerState);
+  window.addEventListener("blur", sendViewerState);
+
+  const position = (event) => {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.round(((event.clientX - rect.left) / rect.width) * canvas.width),
+      y: Math.round(((event.clientY - rect.top) / rect.height) * canvas.height),
+    };
+  };
+  const sendPointer = (event, type) => {
+    const point = position(event);
+    send({
+      type: "pointer",
+      event: type,
+      ...point,
+      button: pointerButton(event.button),
+      buttons: event.buttons,
+      clickCount: event.detail || (type === "mousePressed" ? 1 : 0),
+      modifiers: remoteModifiers(event, macOS),
+      sequence: pointerSequence,
+    });
+  };
+  let pendingPointerMove = null;
+  let pointerMoveFrame = 0;
+  const sendPendingPointerMove = () => {
+    if (pendingPointerMove) send(pendingPointerMove);
+    pendingPointerMove = null;
+  };
+  canvas.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    pointerSequence = (pointerSequence + 1) % 1_000_000_000;
+    pointerDown = true;
+    pointerEditable = null;
+    canvas.setPointerCapture(event.pointerId);
+    sendPointer(event, "mousePressed");
+    keyCapture.style.left = `${Math.max(8, Math.min(window.innerWidth - 8, event.clientX))}px`;
+    keyCapture.style.top = `${Math.max(8, Math.min(window.innerHeight - 8, event.clientY))}px`;
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!event.buttons) return;
+    pendingPointerMove = {
+      ...position(event),
+      type: "pointer",
+      event: "mouseMoved",
+      button: pressedPointerButton(event.buttons),
+      buttons: event.buttons,
+      clickCount: 0,
+      modifiers: remoteModifiers(event, macOS),
+    };
+    if (pointerMoveFrame) return;
+    pointerMoveFrame = requestAnimationFrame(() => {
+      pointerMoveFrame = 0;
+      sendPendingPointerMove();
+    });
+  });
+  canvas.addEventListener("pointerup", (event) => {
+    event.preventDefault();
+    pointerDown = false;
+    if (pointerMoveFrame) {
+      cancelAnimationFrame(pointerMoveFrame);
+      pointerMoveFrame = 0;
+    }
+    sendPendingPointerMove();
+    sendPointer(event, "mouseReleased");
+    send({ type: "selection" });
+    if (pointerEditable === true) nativeInput.focus();
+    else if (pointerEditable === false) nativeInput.blur();
+  });
+  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      send({
+        type: "wheel",
+        ...position(event),
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        modifiers: remoteModifiers(event, macOS),
+      });
+    },
+    { passive: false },
+  );
+
+  const held = new Set();
+  const selectedLocalText = () =>
+    keyCapture.value.slice(keyCapture.selectionStart || 0, keyCapture.selectionEnd || 0);
+  keyCapture.addEventListener("copy", () => {
+    if (selectedLocalText()) setStatus("已复制到本机剪贴板", "online");
+  });
+  keyCapture.addEventListener("cut", () => {
+    if (!selectedLocalText()) return;
+    const sent = send({ type: "cut" });
+    setStatus(sent ? "已剪切到本机剪贴板" : "工作区连接尚未恢复", sent ? "online" : "error");
+  });
+  keyCapture.addEventListener("keydown", (event) => {
+    if (!shouldForwardKey(event)) return;
+    event.preventDefault();
+    held.add(event.code);
+    send({
+      type: "key",
+      event: "keyDown",
+      key: event.key,
+      code: event.code,
+      keyCode: event.keyCode,
+      text: event.key === "Enter" ? "\r" : "",
+      modifiers: remoteModifiers(event, macOS),
+      autoRepeat: event.repeat,
+    });
+  });
+  keyCapture.addEventListener("keyup", (event) => {
+    if (!held.has(event.code)) return;
+    event.preventDefault();
+    held.delete(event.code);
+    send({
+      type: "key",
+      event: "keyUp",
+      key: event.key,
+      code: event.code,
+      keyCode: event.keyCode,
+      modifiers: remoteModifiers(event, macOS),
+    });
+    if (event.shiftKey || ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase("en-US") === "a")) {
+      send({ type: "selection" });
+    }
+  });
+  transferPanel = node("aside", { class: "viewer-transfer-panel", hidden: true });
+  const transferFiles = node("div", { class: "viewer-transfer-files" });
+  const transferHint = node("p", { class: "muted" });
+  const updateSelectionButton = () => {
+    confirmSelection.disabled = !selectedUploadIds.size;
+  };
+  confirmSelection = button("选择文件", {
+    class: "button small",
+    disabled: true,
+    onClick: () => {
+      if (!selectedUploadIds.size) return;
+      confirmSelection.disabled = true;
+      if (!send({ type: "selectFiles", uploadIds: [...selectedUploadIds] })) {
+        confirmSelection.disabled = false;
+        setStatus("工作区连接尚未恢复", "error");
+      }
+    },
+  });
+  const closeTransferPanel = () => {
+    transferPanel.hidden = true;
+    if (fileSelection.active) {
+      fileSelection.active = false;
+      selectedUploadIds.clear();
+      send({ type: "cancelFileSelection" });
+      setStatus("文件选择已取消");
+    }
+    if (pointerEditable === true) nativeInput.focus();
+  };
+  const closeTransfers = button("关闭", {
+    class: "button small ghost",
+    onClick: closeTransferPanel,
+  });
+  transferPanel.append(
+    node(
+      "div",
+      { class: "item-title" },
+      node("h2", {}, "私人文件"),
+      node("div", { class: "row-actions" }, confirmSelection, closeTransfers),
+    ),
+    transferHint,
+    transferFiles,
+  );
+
+  const renderTransferFiles = (files) => {
+    transferFiles.replaceChildren();
+    const availableUploads = new Set(
+      files.filter((file) => file.kind === "upload" && file.state === "ready").map((file) => file.id),
+    );
+    for (const id of selectedUploadIds) {
+      if (!availableUploads.has(id)) selectedUploadIds.delete(id);
+    }
+    const stateLabels = { ready: "可用", in_progress: "下载中", failed: "失败" };
+    for (const file of files) {
+      const selectable = fileSelection.active && file.kind === "upload" && file.state === "ready";
+      const selector = selectable
+        ? node("input", {
+            type: "checkbox",
+            class: "private-file-selector",
+            "aria-label": `选择 ${file.name}`,
+            "data-upload-id": file.id,
+            checked: selectedUploadIds.has(file.id),
+          })
+        : null;
+      selector?.addEventListener("change", () => {
+        if (selector.checked && fileSelection.mode === "selectSingle") {
+          selectedUploadIds.clear();
+          for (const input of transferFiles.querySelectorAll(".private-file-selector")) input.checked = false;
+          selector.checked = true;
+        }
+        if (selector.checked) selectedUploadIds.add(file.id);
+        else selectedUploadIds.delete(file.id);
+        updateSelectionButton();
+      });
+      const remove = button("删除", {
+        class: "button small danger",
+        onClick: async () => {
+          try {
+            await request(`/w/${workspace.id}/api/transfers/${file.id}`, { method: "DELETE" });
+            selectedUploadIds.delete(file.id);
+            await refreshTransfers();
+          } catch (error) {
+            setStatus(error.message, "error");
+          }
+        },
+      });
+      const actions = [];
+      if (file.kind === "download" && file.state === "ready") {
+        actions.push(node("a", { class: "button small", href: `/w/${workspace.id}/files/${file.id}` }, "保存到本机"));
+      }
+      actions.push(remove);
+      transferFiles.append(
+        node(
+          "article",
+          { class: selectable ? "transfer-row selectable" : "transfer-row" },
+          selector,
+          node(
+            "div",
+            { class: "transfer-file-info" },
+            node("strong", {}, file.name),
+            node(
+              "span",
+              { class: "muted" },
+              `${file.kind === "upload" ? "私人文件" : "远端下载"} · ${formatBytes(file.size || file.receivedBytes)} · ${stateLabels[file.state] || file.state}`,
+            ),
+          ),
+          node("div", { class: "row-actions" }, actions),
+        ),
+      );
+    }
+    if (!files.length) transferFiles.append(node("p", { class: "muted" }, "暂无文件。"));
+    updateSelectionButton();
+  };
+
+  async function refreshTransfers() {
+    if (!fileTransfer.enabled) return;
+    const result = await request(`/w/${workspace.id}/api/transfers`);
+    renderTransferFiles(result.files);
+  }
+
+  async function openTransferPanel(selecting = false) {
+    if (!selecting) {
+      fileSelection.active = false;
+      selectedUploadIds.clear();
+    }
+    controlPanel.hidden = true;
+    menuToggle.setAttribute("aria-expanded", "false");
+    menuToggle.setAttribute("aria-label", "打开工作区菜单");
+    confirmSelection.hidden = !fileSelection.active;
+    transferHint.textContent = fileSelection.active
+      ? "选择要交给当前 ChatGPT 上传入口的文件。"
+      : "上传文件仅保存于当前用户的私人目录；远端下载可保存到本机。";
+    transferPanel.hidden = false;
+    await refreshTransfers();
+  }
+
+  const uploadInput = node("input", { type: "file", multiple: true, class: "hidden-file-input" });
+  const upload = button("上传文件", {
+    class: "button small ghost",
+    disabled: !fileTransfer.enabled,
+    onClick: () => uploadInput.click(),
+  });
+  uploadInput.addEventListener("change", async () => {
+    const files = [...uploadInput.files];
+    uploadInput.value = "";
+    if (!files.length) return;
+    if (files.length > 10) {
+      setStatus("一次最多选择 10 个文件", "error");
+      return;
+    }
+    upload.disabled = true;
+    try {
+      const uploaded = [];
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        if (fileTransfer.maxFileBytes && file.size > fileTransfer.maxFileBytes) {
+          throw new Error(`${file.name} 超过单文件上限 ${formatBytes(fileTransfer.maxFileBytes)}`);
+        }
+        const result = await uploadFile(`/w/${workspace.id}/api/uploads`, file, (progress) => {
+          setStatus(`上传 ${index + 1}/${files.length}：${Math.round(progress * 100)}%`, "online");
+        });
+        uploaded.push(result.file);
+      }
+      setStatus(`已保存到私人文件区：${uploaded.length} 个文件`, "online");
+      await openTransferPanel(false);
+    } catch (error) {
+      setStatus(error.message, "error");
+    } finally {
+      upload.disabled = !fileTransfer.enabled;
+    }
+  });
+
+  const downloads = button("查看文件", {
+    class: "button small ghost",
+    disabled: !fileTransfer.enabled,
+    onClick: () => openTransferPanel(false).catch((error) => setStatus(error.message, "error")),
+  });
+
+  const startParts = new URL(workspace.startUrl).pathname.split("/").filter(Boolean);
+  const homeButton = startParts.length === 3 && startParts[0] === "g" && startParts[2] === "project"
+    ? button("项目首页", {
+        class: "viewer-home-button",
+        onClick: () => {
+          if (!send({ type: "projectHome" })) {
+            setStatus("工作区连接尚未恢复", "error");
+            return;
+          }
+          if (!transferPanel.hidden) closeTransferPanel();
+          setPanelOpen(false);
+        },
+      })
+    : null;
+  const reload = button("刷新页面", { class: "button small ghost", onClick: () => send({ type: "reload" }) });
+  const fullscreen = button("进入全屏", {
+    class: "button small ghost",
+    onClick: () => app.requestFullscreen().catch((error) => setStatus(error.message, "error")),
+  });
+  const logout = button("退出登录", {
+    class: "button small ghost",
+    onClick: async () => {
+      try {
+        await request(`/w/${workspace.id}/logout`, { method: "POST" });
+        intentionalClose = true;
+        socket?.close();
+        location.reload();
+      } catch (error) {
+        setStatus(error.message, "error");
+      }
+    },
+  });
+
+  controlPanel = node(
+    "aside",
+    { class: "viewer-control-panel", hidden: true, "aria-label": "工作区菜单" },
+    node(
+      "div",
+      { class: "viewer-panel-heading" },
+      node("div", { class: "viewer-panel-identity" }, node("strong", {}, workspace.name)),
+      status,
+    ),
+    node("div", { class: "viewer-panel-actions" }, upload, uploadInput, downloads, fullscreen, reload, logout),
+  );
+  menuToggle = node(
+    "button",
+    {
+      type: "button",
+      class: "viewer-menu-toggle",
+      title: "打开工作区菜单",
+      "aria-label": "打开工作区菜单",
+      "aria-expanded": "false",
+      onClick: () => setPanelOpen(controlPanel.hidden),
+    },
+    node("span", { class: "viewer-menu-icon", "aria-hidden": "true" }),
+  );
+  setPanelOpen = (open) => {
+    if (open && !transferPanel.hidden) {
+      closeTransferPanel();
+    }
+    controlPanel.hidden = !open;
+    menuToggle.setAttribute("aria-expanded", String(open));
+    menuToggle.setAttribute("aria-label", open ? "收起工作区菜单" : "打开工作区菜单");
+    if (!open && pointerEditable === true) nativeInput.focus();
+  };
+  const viewer = node("div", { class: "viewer" }, stage, homeButton, menuToggle, controlPanel, transferPanel, keyCapture);
+  replace(viewer);
+
+  let resizeTimer;
+  new ResizeObserver(() => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const rect = stage.getBoundingClientRect();
+      send({ type: "resize", width: Math.round(rect.width), height: Math.round(rect.height) });
+    }, 180);
+  }).observe(stage);
+  connect();
+}
+
+async function renderWorkspace(workspaceId) {
+  document.title = workspaceId;
   try {
-    await refresh();
-    if (state.view === "login") setHash("/");
-  } catch {
-    state.me = null;
-    state.boot = false;
-    setHash("/login");
-    render();
+    const bootstrap = await request(`/w/${workspaceId}/api/bootstrap`);
+    if (!bootstrap.authenticated) {
+      renderAuth({ workspace: bootstrap.workspace });
+      return;
+    }
+    renderViewer(bootstrap.workspace, bootstrap.fileTransfer);
+  } catch (error) {
+    replace(
+      shell(
+        "无法打开工作区",
+        error.message,
+        node("section", { class: "card auth-card" }, node("a", { class: "button", href: "/" }, "返回入口")),
+      ),
+    );
   }
-  setInterval(tick, 5000);
-})();
+}
+
+async function main() {
+  if (location.pathname === "/admin" || location.pathname.startsWith("/admin/")) {
+    await renderAdmin();
+    return;
+  }
+  const workspace = location.pathname.match(/^\/w\/([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)\/$/);
+  if (workspace) {
+    await renderWorkspace(workspace[1]);
+    return;
+  }
+  renderHome();
+}
+
+if (app) main().catch((error) => replace(message(error.message)));

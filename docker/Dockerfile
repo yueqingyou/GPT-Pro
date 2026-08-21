@@ -1,11 +1,8 @@
-# GPT-Pro on Cloud — 桌面实例
-# Linux 容器（amd64 / arm64）。Mac / Windows 通过 Docker Desktop 跑这一份。
 FROM lscr.io/linuxserver/baseimage-kasmvnc:debianbookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Chromium 必须钉死版本。Debian 滚动版在 KasmVNC + 软件渲染下反复崩
-#（149 变换矩阵断言、150 非首跑 SIGTRAP）。升级 = 改下面两行并真机验证。
+# Chromium 版本升级必须重新验证 KasmVNC 软件渲染与 Profile 重启。
 ARG CHROMIUM_SNAPSHOT=20260704T180435Z
 ARG CHROMIUM_VERSION=149.0.7827.196-1~deb12u1
 
@@ -27,7 +24,7 @@ RUN set -eux; \
         curl ca-certificates locales \
         fonts-noto-cjk fonts-noto-color-emoji fonts-wqy-microhei \
         chromium="${CHROMIUM_VERSION}" \
-        xdotool xclip xsettingsd; \
+        xsettingsd; \
     chromium --version; \
     rm -f /etc/apt/sources.list.d/gpc-chromium-pin.list /etc/apt/preferences.d/gpc-chromium-pin; \
     mv /gpc-apt-bak/sources.list /etc/apt/sources.list; \
@@ -45,15 +42,15 @@ ENV LANG=zh_CN.UTF-8 \
 COPY identity.sh /custom-cont-init.d/00-identity
 COPY update-autostart.sh /custom-cont-init.d/01-autostart
 COPY proxy-init.sh /custom-cont-init.d/02-proxy
-COPY hide-kasm.sh /custom-cont-init.d/03-hide-kasm
-COPY clipd.py /usr/local/bin/gpc-clipd
+COPY transfer-init.sh /custom-cont-init.d/03-transfer
+COPY hide-kasm.sh /custom-cont-init.d/04-hide-kasm
 COPY cdp-fwd.py /usr/local/bin/gpc-cdp-fwd
 COPY autostart /defaults/autostart
 RUN chmod 755 /custom-cont-init.d/00-identity \
               /custom-cont-init.d/01-autostart \
               /custom-cont-init.d/02-proxy \
-              /custom-cont-init.d/03-hide-kasm \
-              /usr/local/bin/gpc-clipd \
+              /custom-cont-init.d/03-transfer \
+              /custom-cont-init.d/04-hide-kasm \
               /usr/local/bin/gpc-cdp-fwd \
               /defaults/autostart
 

@@ -1,135 +1,86 @@
 import http from "node:http";
-import { readFileSync, existsSync } from "node:fs";
-import { extname, join, dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import httpProxy from "http-proxy";
-import { createSessionToken, readSession, createLoginLimiter, createSessionStore } from "../lib/auth.mjs";
-import { parseInstances } from "../lib/instances.mjs";
-import { createDeskRegistry, provisionDesk, retireDesk } from "../lib/desks.mjs";
-import { createDockerClient, ensureDeskContainer, removeDeskContainer } from "../lib/docker.mjs";
-import { createUserStore } from "../lib/users.mjs";
-import { createPresence } from "../lib/presence.mjs";
+import { WebSocketServer } from "ws";
+import { createLoginLimiter, createSessionStore, createSessionToken, readSession } from "../lib/auth.mjs";
+import { WorkspaceBroker } from "../lib/cdp.mjs";
 import { createSocketHub, kickLiveSession } from "../lib/kick.mjs";
-import { evaluateInDesk, waitForDesk, peekClipboard, isShareUrl, SHARE_CLICK, projectOnboardScript, sleep } from "../lib/chrome.mjs";
-import { applyDeskProxyLive, applyDeskProxiesLive } from "../lib/proxy.mjs";
+import { manualBrowserProfile, resolveAutomaticBrowserProfile } from "../lib/profile.mjs";
+import { createStateStore, WORKSPACE_ID_RE } from "../lib/store.mjs";
+import { createTransferStore } from "../lib/transfers.mjs";
 
-const PORT = Number(process.env.PORT || 8080);
-const AUTH_USER = process.env.AUTH_USER || "admin";
-const AUTH_PASSWORD = String(process.env.AUTH_PASSWORD || "").trim(); // 可选：留空走首次访问向导
-const SEED = parseInstances(process.env.INSTANCES || "a,b");
-const registry = createDeskRegistry(SEED);
-const docker = createDockerClient({
-  socketPath: process.env.DOCKER_SOCKET || "/var/run/docker.sock",
-  templateName: process.env.DESKTOP_TEMPLATE || "gpt-pro-cloud-a",
-});
-const VNC_USER = process.env.VNC_USER || "abc";
-const VNC_PASSWORD = process.env.VNC_PASSWORD || "";
-const COOKIE = "gpc_session";
-const DESK = "gpc_desk";
-const TTL_MS = 14 * 24 * 60 * 60 * 1000;
-const WEB = join(dirname(fileURLToPath(import.meta.url)), "web");
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_WEB = join(HERE, "web");
+const ADMIN_COOKIE = "gpc_admin_session";
+const WORKSPACE_COOKIE = "gpc_workspace_session";
+const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const BODY_LIMIT = 64 * 1024;
 
-const USERS_FILE = process.env.USERS_FILE || "/data/users.json";
-const users = createUserStore({
-  file: USERS_FILE,
-  adminUser: AUTH_USER,
-  adminPassword: AUTH_PASSWORD,
-  deskIds: SEED.map((i) => i.id),
-});
-for (const id of users.extraDeskIds()) registry.add(id);
-const presence = createPresence();
-const sessions = createSessionStore({ file: join(dirname(USERS_FILE), "sessions.json"), ttlMs: TTL_MS });
-const liveSockets = createSocketHub();
-const loginLimiter = createLoginLimiter({ maxFails: 10, windowMs: 15 * 60 * 1000 });
-const onboardLocks = new Map();
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "img-src 'self' data: blob:",
+  "connect-src 'self' ws: wss:",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+].join("; ");
 
-async function withOnboardLock(id, fn) {
-  const prev = onboardLocks.get(id) || Promise.resolve();
-  let release;
-  const gate = new Promise((r) => {
-    release = r;
-  });
-  onboardLocks.set(
-    id,
-    prev.then(() => gate),
-  );
-  await prev.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    release();
-  }
-}
-
-async function runOnboard(id, name, { create = true } = {}) {
-  await waitForDesk(id, 45000);
-  let last = { ok: false, error: "工作区还没准备好" };
-  for (let i = 0; i < 3; i++) {
-    last = await evaluateInDesk(id, projectOnboardScript(name, { create }));
-    if (last?.ok) return last;
-    if (!create && last?.error === "找不到项目") {
-      last = await evaluateInDesk(id, projectOnboardScript(name, { create: true }));
-      if (last?.ok) return last;
+function parseCookies(header) {
+  const cookies = {};
+  for (const part of String(header || "").split(";")) {
+    const index = part.indexOf("=");
+    if (index < 0) continue;
+    const name = part.slice(0, index).trim();
+    if (!name || Object.hasOwn(cookies, name)) continue;
+    try {
+      cookies[name] = decodeURIComponent(part.slice(index + 1).trim());
+    } catch {
+      cookies[name] = "";
     }
-    await sleep(1500);
   }
-  return last;
+  return cookies;
 }
 
-function kickOnboard(id, user) {
-  const name = String(user.username || "").trim();
-  if (!name) return;
-  const uid = user.id;
-  const create = !users.readyOn(uid, id);
-  withOnboardLock(id, () => runOnboard(id, name, { create }))
-    .then((r) => {
-      if (r?.ok) users.update(uid, { projectReady: true, projectName: name, projectDesk: id });
-    })
-    .catch(() => {});
+function isHttps(req) {
+  return String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
 }
 
-const proxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true, xfwd: true });
-proxy.on("proxyReq", (proxyReq) => {
-  if (!VNC_PASSWORD) return;
-  proxyReq.setHeader("Authorization", `Basic ${Buffer.from(`${VNC_USER}:${VNC_PASSWORD}`).toString("base64")}`);
-});
-proxy.on("proxyRes", (proxyRes) => {
-  proxyRes.headers["permissions-policy"] = "clipboard-read=*, clipboard-write=*";
-  delete proxyRes.headers["cross-origin-embedder-policy"];
-  delete proxyRes.headers["cross-origin-opener-policy"];
-  delete proxyRes.headers["cross-origin-resource-policy"];
-});
-proxy.on("error", (err, _req, res) => {
-  console.error("proxy error:", err.message);
-  if (res && !res.headersSent && typeof res.writeHead === "function") {
-    res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-    res.end("暂时无法连接");
-  }
-});
-
-function parseCookie(header) {
-  const out = {};
-  if (!header) return out;
-  for (const part of header.split(";")) {
-    const i = part.indexOf("=");
-    if (i < 0) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
-}
-
-function getSession(req) {
-  const rec = readSession(sessions, parseCookie(req.headers.cookie)[COOKIE], Date.now(), TTL_MS);
-  if (!rec) return null;
-  const user = users.get(rec.userId);
-  if (!user || user.disabled) return null;
-  return { ...rec, user };
+function setCookie(req, res, { name, value, path, maxAge }) {
+  const previous = res.getHeader("set-cookie");
+  const list = previous ? (Array.isArray(previous) ? previous : [previous]) : [];
+  const secure = isHttps(req) ? "; Secure" : "";
+  list.push(
+    `${name}=${encodeURIComponent(value)}; Path=${path}; HttpOnly; SameSite=Strict; Max-Age=${Math.max(0, Math.floor(maxAge))}${secure}`,
+  );
+  res.setHeader("set-cookie", list);
 }
 
 function clientIp(req) {
-  // 经 Cloudflare Tunnel 时源地址是本机，真实来源在 CF-Connecting-IP；
-  // 直连入口只在内网（BIND_ADDR 绑内网地址），伪造该头无利可图。
-  return String(req.headers["cf-connecting-ip"] || req.socket?.remoteAddress || "unknown");
+  return String(req.socket?.remoteAddress || "unknown");
+}
+
+function limiterUsername(raw) {
+  return String(raw || "").trim().toLocaleLowerCase("en-US").slice(0, 64);
+}
+
+function originAllowed(req) {
+  const origin = String(req.headers.origin || "").trim();
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === String(req.headers.host || "");
+  } catch {
+    return false;
+  }
+}
+
+function enabled(raw, defaultValue = true) {
+  const value = String(raw ?? "").trim().toLocaleLowerCase("en-US");
+  if (!value) return defaultValue;
+  return !["0", "false", "no", "off"].includes(value);
 }
 
 function json(res, status, body) {
@@ -137,467 +88,916 @@ function json(res, status, body) {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
-    "referrer-policy": "same-origin",
+    "referrer-policy": "no-referrer",
   });
   res.end(JSON.stringify(body));
 }
 
-function setCookie(res, name, value, maxAge) {
-  const prev = res.getHeader("set-cookie");
-  const list = prev ? (Array.isArray(prev) ? prev : [prev]) : [];
-  list.push(`${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
-  res.setHeader("set-cookie", list);
+function uploadName(req) {
+  const raw = String(req.headers["x-gpc-file-name"] || "");
+  try {
+    return decodeURIComponent(raw) || "file";
+  } catch {
+    throw Object.assign(new Error("上传文件名编码无效"), { status: 400 });
+  }
 }
 
-const BODY_LIMIT = 1024 * 1024;
+function sendTransferFile(req, res, file) {
+  const asciiName = file.entry.name.replace(/[^\x20-\x7e]|["\\]/g, "_").slice(0, 120) || "download";
+  const encoded = encodeURIComponent(file.entry.name).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  res.writeHead(200, {
+    "content-type": file.entry.mimeType || "application/octet-stream",
+    "content-length": file.size,
+    "content-disposition": `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  const stream = file.stream();
+  stream.on("error", () => res.destroy());
+  stream.pipe(res);
+}
 
 async function readBody(req) {
   const chunks = [];
   let size = 0;
-  for await (const c of req) {
-    size += c.length;
-    if (size > BODY_LIMIT) throw new Error("body too large");
-    chunks.push(c);
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > BODY_LIMIT) {
+      const error = new Error("请求体太大");
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
   }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {};
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text) return {};
   try {
-    return JSON.parse(raw);
+    return JSON.parse(text);
   } catch {
-    return Object.fromEntries(new URLSearchParams(raw));
+    const error = new Error("请求体必须是 JSON");
+    error.status = 400;
+    throw error;
   }
 }
 
-const PANEL_CSP = [
-  "default-src 'self'",
-  "script-src 'self'",
-  "style-src 'self' https://fonts.googleapis.com",
-  "font-src https://fonts.gstatic.com",
-  "img-src 'self' data: blob:",
-  "connect-src 'self'",
-  "frame-src 'self'",
-  "frame-ancestors 'self'",
-  "base-uri 'self'",
-  "form-action 'self'",
-].join("; ");
+function publicWorkspace(workspace) {
+  return workspace
+    ? {
+        id: workspace.id,
+        name: workspace.name,
+        startUrl: workspace.startUrl,
+        lastUrl: workspace.lastUrl,
+      }
+    : null;
+}
 
-function serveStatic(res, pathname) {
-  const file = pathname === "/" ? "index.html" : pathname.slice(1);
-  const full = join(WEB, file);
-  if (!full.startsWith(WEB) || !existsSync(full)) return false;
-  const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8" };
+function workspaceRoute(pathname) {
+  const match = pathname.match(/^\/w\/([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)(\/.*|\/$)/);
+  return match ? { id: match[1], suffix: match[2] } : null;
+}
+
+const WEB_FILES = new Map([
+  ["/", "index.html"],
+  ["/app.js", "app.js"],
+  ["/app.css", "app.css"],
+  ["/text-input.js", "text-input.js"],
+  ["/admin-browser.js", "admin-browser.js"],
+]);
+
+function serveFile(webDir, res, pathname) {
+  const filename = WEB_FILES.get(pathname);
+  if (!filename) return false;
+  const full = join(webDir, filename);
+  if (!full.startsWith(webDir) || !existsSync(full)) return false;
+  const types = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+  };
   const headers = {
     "content-type": types[extname(full)] || "application/octet-stream",
     "cache-control": "no-store",
-    "permissions-policy": "clipboard-read=*, clipboard-write=*",
     "x-content-type-options": "nosniff",
-    "referrer-policy": "same-origin",
+    "referrer-policy": "no-referrer",
   };
-  if (extname(full) === ".html" || pathname === "/") headers["content-security-policy"] = PANEL_CSP;
+  if (filename === "index.html") headers["content-security-policy"] = CSP;
   res.writeHead(200, headers);
   res.end(readFileSync(full));
   return true;
 }
 
-async function handleApi(req, res, url, sess) {
-  if (url.pathname === "/api/setup" && req.method === "GET") {
-    return json(res, 200, { needed: !users.hasAdmin() });
-  }
-  if (url.pathname === "/api/setup" && req.method === "POST") {
-    if (users.hasAdmin()) return json(res, 403, { error: "已完成初始化" });
-    const body = await readBody(req);
-    try {
-      const user = users.createAdmin({ username: body.username, password: body.password });
-      const token = createSessionToken();
-      sessions.set(token, { userId: user.id, expires: Date.now() + TTL_MS });
-      setCookie(res, COOKIE, token, Math.floor(TTL_MS / 1000));
-      console.log(`setup: admin ${user.username} created ip=${clientIp(req)}`);
-      return json(res, 200, { user });
-    } catch (e) {
-      return json(res, 400, { error: e.message });
-    }
-  }
-  if (url.pathname === "/api/login" && req.method === "POST") {
-    const body = await readBody(req);
-    const ip = clientIp(req);
-    const key = `${ip}|${String(body.username || "").trim().slice(0, 64)}`;
-    if (loginLimiter.blocked(key)) {
-      console.warn(`login blocked (rate limit) user=${body.username} ip=${ip}`);
-      return json(res, 429, { error: "尝试次数过多，请 15 分钟后再试" });
-    }
-    const user = users.login(body.username, body.password);
-    if (!user) {
-      loginLimiter.fail(key);
-      console.warn(`login fail user=${body.username} ip=${ip}`);
-      return json(res, 401, { error: "用户名或密码错误" });
-    }
-    loginLimiter.ok(key);
-    console.log(`login ok user=${user.username} ip=${ip}`);
-    const token = createSessionToken();
-    sessions.set(token, { userId: user.id, expires: Date.now() + TTL_MS });
-    setCookie(res, COOKIE, token, Math.floor(TTL_MS / 1000));
-    return json(res, 200, { user });
-  }
-  if (url.pathname === "/api/logout" && req.method === "POST") {
-    const token = parseCookie(req.headers.cookie)[COOKIE];
-    if (token) sessions.delete(token);
-    setCookie(res, COOKIE, "", 0);
-    setCookie(res, DESK, "", 0);
-    return json(res, 200, { ok: true });
-  }
-  if (!sess) return json(res, 401, { error: "未登录" });
-  if (url.pathname === "/api/me") return json(res, 200, { user: sess.user, settings: users.settings() });
-  if (url.pathname === "/api/settings" && req.method === "GET") return json(res, 200, { settings: users.settings() });
-  if (url.pathname === "/api/admin/settings" && req.method === "POST") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    const body = await readBody(req);
-    return json(res, 200, { settings: users.setSettings(body) });
-  }
-  if (url.pathname === "/api/desks") {
-    const isAdmin = sess.user.role === "admin";
-    const desks = registry
-      .all()
-      .filter((d) => users.canOpen(sess.user, d.id))
-      .map((d) => ({
-        id: d.id,
-        name: users.deskNameOf(d.id) || d.name,
-        ...(isAdmin ? { proxy: users.deskProxyOf(d.id), extra: users.isExtraDesk(d.id) } : {}),
-      }));
-    return json(res, 200, { desks, ...(isAdmin ? { proxyPresets: users.proxyPresets() } : {}) });
-  }
-  if (url.pathname === "/api/admin/desks" && req.method === "POST") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    const body = await readBody(req);
-    try {
-      const desk = await provisionDesk({
-        users,
-        registry,
-        name: body.name,
-        id: body.id,
-        ensure: (id) => ensureDeskContainer(id, docker),
-      });
-      console.log(`desk added id=${desk.id} name=${desk.name} by=${sess.user.username} ip=${clientIp(req)}`);
-      return json(res, 200, { desk });
-    } catch (e) {
-      return json(res, e.status || 400, { error: e.message });
-    }
-  }
-  const rename = url.pathname.match(/^\/api\/admin\/desks\/([a-z0-9-]+)$/);
-  if (rename && req.method === "DELETE") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    const id = rename[1];
-    try {
-      for (const v of presence.list(id)) {
-        if (v.id) kickLiveSession({ sessions, presence, sockets: liveSockets }, v.id);
-      }
-      presence.clear(id);
-      const desk = await retireDesk({
-        users,
-        registry,
-        id,
-        remove: (deskId) => removeDeskContainer(deskId, docker),
-      });
-      console.log(`desk removed id=${desk.id} by=${sess.user.username} ip=${clientIp(req)}`);
-      return json(res, 200, { ok: true, desk });
-    } catch (e) {
-      return json(res, e.status || 400, { error: e.message });
-    }
-  }
-  if (rename && req.method === "PATCH") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    if (!registry.has(rename[1])) return json(res, 404, { error: "账号不存在" });
-    try {
-      const body = await readBody(req);
-      const out = { ok: true };
-      if ("name" in body) out.name = users.renameDesk(rename[1], body.name) || registry.get(rename[1]).name;
-      if ("proxy" in body) {
-        const proxy = users.setDeskProxy(rename[1], body.proxy);
-        try {
-          await applyDeskProxyLive(rename[1], proxy);
-        } catch {
-          return json(res, 502, { error: "代理已保存，但账号容器暂时不可达，重启该容器后生效" });
-        }
-        out.proxy = proxy;
-      }
-      return json(res, 200, out);
-    } catch (e) {
-      return json(res, 400, { error: e.message });
-    }
-  }
-  if (url.pathname === "/api/admin/proxies" && req.method === "POST") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    try {
-      const body = await readBody(req);
-      const proxy = users.setAllDeskProxies(body.proxy);
-      const ids = registry.ids();
-      const { failed } = await applyDeskProxiesLive(ids, proxy);
-      if (failed.length) {
-        return json(res, 502, {
-          error: failed.length === ids.length
-            ? "代理已保存，但账号容器暂时不可达，重启这些容器后生效"
-            : "代理已保存，但部分账号容器暂时不可达，重启这些容器后生效",
-          proxy,
-          failed,
-        });
-      }
-      return json(res, 200, { ok: true, proxy, desks: ids.length });
-    } catch (e) {
-      return json(res, e.status || 400, { error: e.message });
-    }
-  }
-  if (url.pathname === "/api/presence") {
-    const all = presence.all();
-    if (sess.user.role === "admin") return json(res, 200, { presence: all });
-    const mine = {};
-    for (const d of registry.all()) {
-      if (users.canOpen(sess.user, d.id) && all[d.id]) mine[d.id] = all[d.id];
-    }
-    return json(res, 200, { presence: mine });
-  }
-  if (url.pathname === "/api/presence/beat" && req.method === "POST") {
-    const body = await readBody(req);
-    const deskId = String(body.deskId || parseCookie(req.headers.cookie)[DESK] || "");
-    if (!users.canOpen(sess.user, deskId)) return json(res, 403, { error: "没有访问权限" });
-    return json(res, 200, { viewers: presence.beat(deskId, sess.user) });
-  }
-  if (url.pathname === "/api/presence/leave" && req.method === "POST") {
-    presence.leaveAll(sess.user.id);
-    return json(res, 200, { ok: true, presence: presence.all() });
-  }
-  const open = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/open$/);
-  if (open && req.method === "POST") {
-    const id = open[1];
-    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
-    setCookie(res, DESK, id, Math.floor(TTL_MS / 1000));
-    presence.beat(id, sess.user);
-    if (users.assistOn()) kickOnboard(id, sess.user);
-    return json(res, 200, { ok: true, id });
-  }
-  const paste = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/paste$/);
-  if (paste && req.method === "POST") {
-    const id = paste[1];
-    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
-    const body = Buffer.concat(chunks);
-    if (!body.length) return json(res, 400, { error: "空内容" });
-    if (body.length > 8 * 1024 * 1024) return json(res, 413, { error: "太大了" });
-    const ct = String(req.headers["content-type"] || "text/plain; charset=utf-8");
-    try {
-      const r = await fetch(`http://desktop-${id}:18790/`, {
-        method: "POST",
-        headers: { "content-type": ct, "content-length": String(body.length) },
-        body,
-      });
-      if (!r.ok) return json(res, 502, { error: "无法粘贴" });
-      return json(res, 200, { ok: true });
-    } catch {
-      return json(res, 502, { error: "无法粘贴" });
-    }
-  }
-  const copy = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/copy$/);
-  if (copy && req.method === "POST") {
-    const id = copy[1];
-    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
-    try {
-      const r = await fetch(`http://desktop-${id}:18790/grab`, { method: "POST" });
-      if (!r.ok) return json(res, 502, { error: "无法复制" });
-      const buf = Buffer.from(await r.arrayBuffer());
-      const ct = r.headers.get("content-type") || "text/plain; charset=utf-8";
-      res.writeHead(200, { "content-type": ct, "cache-control": "no-store" });
-      res.end(buf);
-      return;
-    } catch {
-      return json(res, 502, { error: "无法复制" });
-    }
-  }
-  const peek = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/peek$/);
-  if (peek && req.method === "GET") {
-    const id = peek[1];
-    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
-    try {
-      const { ct, buf } = await peekClipboard(id);
-      res.writeHead(200, { "content-type": ct, "cache-control": "no-store" });
-      res.end(buf);
-      return;
-    } catch {
-      return json(res, 502, { error: "无法读取剪贴板" });
-    }
-  }
-  const share = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/share$/);
-  if (share && req.method === "POST") {
-    const id = share[1];
-    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
-    if (!users.assistOn()) return json(res, 403, { error: "未开启页面协助" });
-    try {
-      const clicked = await evaluateInDesk(id, SHARE_CLICK);
-      if (!clicked?.ok) return json(res, 400, { error: clicked?.error || "分享失败" });
-      await sleep(400);
-      const { ct, buf } = await peekClipboard(id);
-      const text = buf.toString("utf8").trim();
-      if (!isShareUrl(text)) return json(res, 200, { ok: true, url: "" });
-      return json(res, 200, { ok: true, url: text.split(/\s+/)[0] });
-    } catch (e) {
-      return json(res, 502, { error: e.message || "分享失败" });
-    }
-  }
-  const onboard = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/onboard$/);
-  if (onboard && req.method === "POST") {
-    const id = onboard[1];
-    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
-    if (!users.assistOn()) return json(res, 403, { error: "未开启页面协助" });
-    const name = String(sess.user.username || "").trim();
-    if (!name) return json(res, 400, { error: "没有用户名" });
-    try {
-      const create = !users.readyOn(sess.user.id, id);
-      const r = await withOnboardLock(id, () => runOnboard(id, name, { create }));
-      if (!r?.ok) return json(res, 400, { error: r?.error || "工作区还没准备好" });
-      users.update(sess.user.id, { projectReady: true, projectName: name, projectDesk: id });
-      return json(res, 200, { ok: true, name, action: r.action || "opened", created: r.action === "created" });
-    } catch (e) {
-      const raw = e.message || "";
-      const error = /chromium|ChatGPT 页面|无法连接|未就绪/i.test(raw) ? "工作区还没准备好" : raw || "工作区还没准备好";
-      return json(res, 502, { error });
-    }
-  }
-  if (url.pathname === "/api/admin/users" && req.method === "GET") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    return json(res, 200, { users: users.list() });
-  }
-  if (url.pathname === "/api/admin/users" && req.method === "POST") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    try {
-      const body = await readBody(req);
-      return json(res, 200, { user: users.create(body) });
-    } catch (e) {
-      return json(res, 400, { error: e.message });
-    }
-  }
-  const kick = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/kick$/);
-  if (kick && req.method === "POST") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    const user = users.get(kick[1]);
-    if (!user) return json(res, 404, { error: "用户不存在" });
-    const dropped = kickLiveSession({ sessions, presence, sockets: liveSockets }, kick[1]);
-    console.log(`kick user=${user.username} by=${sess.user.username} sessions=${dropped.sessions} sockets=${dropped.sockets} ip=${clientIp(req)}`);
-    return json(res, 200, { ok: true, user, ...dropped, presence: presence.all() });
-  }
-  const one = url.pathname.match(/^\/api\/admin\/users\/([^/]+)$/);
-  if (one && req.method === "PATCH") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    try {
-      const body = await readBody(req);
-      const patch = {};
-      if (Array.isArray(body.desks)) patch.desks = body.desks;
-      if (body.password) patch.password = String(body.password);
-      if (typeof body.disabled === "boolean") patch.disabled = body.disabled;
-      const user = users.update(one[1], patch);
-      if (body.password || body.disabled === true) sessions.deleteByUser(one[1]);
-      if (body.disabled === true) presence.leaveAll(one[1]);
-      return json(res, 200, { user });
-    } catch (e) {
-      return json(res, 400, { error: e.message });
-    }
-  }
-  if (one && req.method === "DELETE") {
-    if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
-    try {
-      users.remove(one[1]);
-      sessions.deleteByUser(one[1]);
-      presence.leaveAll(one[1]);
-      return json(res, 200, { ok: true });
-    } catch (e) {
-      return json(res, 400, { error: e.message });
-    }
-  }
-  return json(res, 404, { error: "not found" });
-}
+export function createGateway({
+  store,
+  broker,
+  sessions,
+  transfers = null,
+  webDir = DEFAULT_WEB,
+  maintenanceTarget = "http://desktop:3000",
+  maintenancePublicPort = 36091,
+  maintenancePublicUrl = "",
+  vncUser = "abc",
+  vncPassword = "",
+  resolveBrowserProfile,
+  logger = console,
+} = {}) {
+  if (!store || !broker || !sessions) throw new Error("createGateway 缺少 store、broker 或 sessions");
 
-async function handle(req, res) {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-  if (url.pathname === "/healthz") {
-    res.writeHead(200, { "content-type": "text/plain" });
-    res.end("ok");
-    return;
+  const limiter = createLoginLimiter({ maxFails: 10, windowMs: 15 * 60 * 1000 });
+  const liveSockets = createSocketHub();
+  const webSockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false });
+  const maintenanceProxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true, xfwd: true });
+  const maintenanceSockets = new Set();
+  const transferCleanup = transfers
+    ? setInterval(() => {
+        try {
+          transfers.cleanup();
+        } catch (error) {
+          logger.warn?.(`清理暂存文件失败：${error.message}`);
+        }
+      }, 60 * 60 * 1000)
+    : null;
+  transferCleanup?.unref?.();
+
+  maintenanceProxy.on("proxyReq", (proxyRequest) => {
+    if (vncPassword) {
+      proxyRequest.setHeader("authorization", `Basic ${Buffer.from(`${vncUser}:${vncPassword}`).toString("base64")}`);
+    }
+  });
+  maintenanceProxy.on("proxyRes", (proxyResponse) => {
+    proxyResponse.headers["cache-control"] = "no-store";
+    delete proxyResponse.headers["x-frame-options"];
+    delete proxyResponse.headers["cross-origin-embedder-policy"];
+    delete proxyResponse.headers["cross-origin-opener-policy"];
+    delete proxyResponse.headers["cross-origin-resource-policy"];
+  });
+  maintenanceProxy.on("error", (error, _req, res) => {
+    logger.error?.(`管理员浏览器代理失败：${error.message}`);
+    if (res && !res.headersSent && typeof res.writeHead === "function") {
+      res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+      res.end("管理员浏览器暂时不可用");
+    }
+  });
+
+  function maintenanceLocation(req) {
+    if (maintenancePublicUrl) return new URL("/", maintenancePublicUrl).toString();
+    const protocol = String(req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
+    const forwardedHost = String(req.headers["x-forwarded-host"] || req.headers.host || "localhost").split(",")[0].trim();
+    const location = new URL(`${protocol}://${forwardedHost}`);
+    location.port = String(maintenancePublicPort);
+    location.pathname = "/";
+    location.search = "";
+    location.hash = "";
+    return location.toString();
   }
-  const sess = getSession(req);
-  if (url.pathname.startsWith("/api/")) {
-    await handleApi(req, res, url, sess);
-    return;
+
+  function sessionRecord(req, cookieName) {
+    const token = parseCookies(req.headers.cookie)[cookieName];
+    const record = readSession(sessions, token, Date.now(), SESSION_TTL_MS);
+    if (!record) return null;
+    const user = store.user(record.userId);
+    if (!user || user.disabled) return null;
+    return { token, record, user };
   }
-  if (url.pathname === "/" || url.pathname === "/app.css" || url.pathname === "/app.js") {
-    if (serveStatic(res, url.pathname === "/" ? "/" : url.pathname)) return;
+
+  function adminSession(req) {
+    const session = sessionRecord(req, ADMIN_COOKIE);
+    return session?.record.kind === "admin" && session.user.role === "admin" ? session : null;
   }
-  if (!sess) {
-    if ((req.headers.upgrade || "").toLowerCase() === "websocket") {
-      res.writeHead(401);
+
+  function workspaceSession(req, workspaceId) {
+    const session = sessionRecord(req, WORKSPACE_COOKIE);
+    if (!session || session.record.kind !== "workspace" || session.record.workspaceId !== workspaceId) return null;
+    return store.canOpen(session.user, workspaceId) ? session : null;
+  }
+
+  function createLogin(req, res, user, { kind, workspaceId = "" }) {
+    const token = createSessionToken();
+    sessions.set(token, {
+      kind,
+      userId: user.id,
+      ...(workspaceId ? { workspaceId } : {}),
+      expires: Date.now() + SESSION_TTL_MS,
+    });
+    setCookie(req, res, {
+      name: kind === "admin" ? ADMIN_COOKIE : WORKSPACE_COOKIE,
+      value: token,
+      path: kind === "admin" ? "/" : `/w/${workspaceId}`,
+      maxAge: SESSION_TTL_MS / 1000,
+    });
+  }
+
+  async function applyManagedRule(label, apply) {
+    try {
+      const runtime = await apply();
+      return { runtime, runtimePending: runtime.failedTargets > 0 };
+    } catch (error) {
+      logger.warn?.(`${label}已保存，等待 Chromium 应用：${error.message}`);
+      return { runtime: { appliedTargets: 0, failedTargets: 0 }, runtimePending: true };
+    }
+  }
+
+  async function handleAdmin(req, res, url) {
+    if (url.pathname === "/admin/api/bootstrap" && req.method === "GET") {
+      const session = adminSession(req);
+      return json(res, 200, { setupNeeded: !store.hasAdmin(), authenticated: !!session, user: session?.user || null });
+    }
+
+    if (url.pathname === "/admin/setup" && req.method === "POST") {
+      if (store.hasAdmin()) return json(res, 403, { error: "管理员已存在" });
+      const body = await readBody(req);
+      try {
+        const user = store.createAdmin({ username: body.username, password: body.password });
+        createLogin(req, res, user, { kind: "admin" });
+        return json(res, 200, { user });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/login" && req.method === "POST") {
+      const body = await readBody(req);
+      const key = `admin|${clientIp(req)}|${limiterUsername(body.username)}`;
+      if (limiter.blocked(key)) return json(res, 429, { error: "尝试次数过多，请稍后再试" });
+      const user = store.login(body.username, body.password);
+      if (!user || user.role !== "admin") {
+        limiter.fail(key);
+        return json(res, 401, { error: "用户名或密码错误" });
+      }
+      limiter.ok(key);
+      createLogin(req, res, user, { kind: "admin" });
+      return json(res, 200, { user });
+    }
+
+    if (url.pathname === "/admin/logout" && req.method === "POST") {
+      const session = adminSession(req);
+      if (session) sessions.delete(session.token);
+      setCookie(req, res, { name: ADMIN_COOKIE, value: "", path: "/", maxAge: 0 });
+      return json(res, 200, { ok: true });
+    }
+
+    const session = adminSession(req);
+    if (!session) return json(res, 401, { error: "未登录" });
+
+    if (url.pathname === "/admin/api/state" && req.method === "GET") {
+      return json(res, 200, {
+        user: session.user,
+        users: store.users(),
+        workspaces: store.workspaces().map(publicWorkspace),
+        browserProfile: store.browserProfile(),
+        composerToolAllowlist: store.composerToolAllowlist(),
+        sensitivePolicy: store.sensitivePolicy(),
+        transfers: transfers
+          ? transfers.listAdmin().map((entry) => ({
+              ...entry,
+              ...(entry.kind === "upload" ? { remotePath: transfers.remotePath(entry.id) } : {}),
+            }))
+          : [],
+        transferLimits: transfers
+          ? { maxFileBytes: transfers.maxFileBytes, quotaBytes: transfers.quotaBytes }
+          : null,
+        browser: broker.status(),
+      });
+    }
+
+    if (url.pathname === "/admin/api/chatgpt-projects" && req.method === "GET") {
+      try {
+        const projects = await broker.listChatGptProjects();
+        return json(res, 200, { projects: store.previewChatGptProjects(projects) });
+      } catch (error) {
+        return json(res, error.status || 503, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/chatgpt-projects/import" && req.method === "POST") {
+      try {
+        const body = await readBody(req);
+        const projects = await broker.listChatGptProjects();
+        const imported = store.importChatGptProjects(projects, body.projectIds);
+        const runtimes = await Promise.allSettled(
+          imported.workspaces.map((workspace) => broker.ensureWorkspace(workspace.id)),
+        );
+        const readyTargets = runtimes.filter((result) => result.status === "fulfilled").length;
+        const failedTargets = runtimes.length - readyTargets;
+        if (failedTargets) logger.warn?.(`${failedTargets} 个导入工作区等待 Chromium 恢复`);
+        return json(res, 201, {
+          imported,
+          runtime: { readyTargets, failedTargets },
+          runtimePending: failedTargets > 0,
+        });
+      } catch (error) {
+        return json(res, error.status || 503, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/composer-tools" && req.method === "PATCH") {
+      try {
+        const body = await readBody(req);
+        const names = store.setComposerToolAllowlist(body.names);
+        const { runtime, runtimePending } = await applyManagedRule("编辑器功能白名单", () =>
+          broker.applyProjectFocus(),
+        );
+        return json(res, 200, { names, runtime, runtimePending });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/sensitive-policy" && req.method === "PATCH") {
+      try {
+        const policy = store.setSensitivePolicy(await readBody(req));
+        const { runtime, runtimePending } = await applyManagedRule("敏感操作黑名单", () =>
+          broker.applySensitivePolicy(),
+        );
+        return json(res, 200, { policy, runtime, runtimePending });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/uploads" && req.method === "POST") {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        const entry = await transfers.receiveUpload(req, {
+          userId: session.user.id,
+          name: uploadName(req),
+          mimeType: req.headers["content-type"],
+          declaredSize: Number(req.headers["content-length"] || 0),
+        });
+        return json(res, 201, { file: { ...entry, remotePath: transfers.remotePath(entry.id) } });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    const adminTransfer = url.pathname.match(/^\/admin\/api\/transfers\/([a-zA-Z0-9-]{8,80})$/);
+    if (adminTransfer && req.method === "DELETE") {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        return json(res, 200, { ok: true, file: transfers.remove(adminTransfer[1], { isAdmin: true }) });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    const adminFile = url.pathname.match(/^\/admin\/files\/([a-zA-Z0-9-]{8,80})$/);
+    if (adminFile && (req.method === "GET" || req.method === "HEAD")) {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        return sendTransferFile(req, res, transfers.openDownload(adminFile[1], { isAdmin: true }));
+      } catch (error) {
+        return json(res, error.status || 404, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/browser-profile" && req.method === "PATCH") {
+      try {
+        const body = await readBody(req);
+        const profile = store.setBrowserProfile(
+          manualBrowserProfile({ timezone: body.timezone, locale: body.locale }),
+        );
+        const { runtime, runtimePending } = await applyManagedRule("浏览器环境", () =>
+          broker.applyBrowserProfile({ reload: true }),
+        );
+        return json(res, 200, { profile, runtime, runtimePending });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/browser-profile/detect" && req.method === "POST") {
+      if (!resolveBrowserProfile) return json(res, 503, { error: "当前部署未配置出口 IP 探测" });
+      try {
+        const result = await resolveBrowserProfile({ force: true });
+        const { runtime, runtimePending } = await applyManagedRule("自动探测结果", () =>
+          broker.applyBrowserProfile({ reload: true }),
+        );
+        return json(res, 200, {
+          profile: result.profile,
+          detected: result.detected,
+          warning: result.warning,
+          runtime,
+          runtimePending,
+        });
+      } catch (error) {
+        return json(res, error.status || 500, { error: error.status ? error.message : "出口 IP 探测失败" });
+      }
+    }
+
+    if (url.pathname === "/admin/api/browser-profile/verify" && req.method === "GET") {
+      try {
+        return json(res, 200, await broker.verifyBrowserProfile());
+      } catch (error) {
+        return json(res, 503, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/workspaces" && req.method === "POST") {
+      try {
+        const workspace = store.createWorkspace(await readBody(req));
+        broker.ensureWorkspace(workspace.id).catch((error) => logger.warn?.(`工作区 ${workspace.id} 等待浏览器：${error.message}`));
+        return json(res, 201, { workspace: publicWorkspace(workspace) });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    const workspaceAction = url.pathname.match(/^\/admin\/api\/workspaces\/([a-z0-9-]+)$/);
+    if (workspaceAction && req.method === "PATCH") {
+      try {
+        const body = await readBody(req);
+        const workspace = store.updateWorkspace(workspaceAction[1], body);
+        let runtimePending = false;
+        if (Object.hasOwn(body, "startUrl")) {
+          try {
+            await broker.navigate(workspace.id, workspace.startUrl);
+          } catch (error) {
+            runtimePending = true;
+            logger.warn?.(`工作区 ${workspace.id} 地址已保存，等待浏览器应用：${error.message}`);
+          }
+        }
+        return json(res, 200, { workspace: publicWorkspace(workspace), runtimePending });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+    if (workspaceAction && req.method === "DELETE") {
+      try {
+        const workspace = store.removeWorkspace(workspaceAction[1]);
+        sessions.deleteByWorkspace(workspace.id);
+        transfers?.removeWorkspace(workspace.id);
+        await broker.removeWorkspace(workspace.id);
+        return json(res, 200, { ok: true, workspace: publicWorkspace(workspace) });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    if (url.pathname === "/admin/api/users" && req.method === "POST") {
+      try {
+        const user = store.createUser(await readBody(req));
+        return json(res, 201, { user });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    const userAction = url.pathname.match(/^\/admin\/api\/users\/([^/]+)$/);
+    if (userAction && req.method === "PATCH") {
+      try {
+        const body = await readBody(req);
+        const user = store.updateUser(userAction[1], body);
+        const shouldRevoke =
+          Object.hasOwn(body, "password") || Object.hasOwn(body, "disabled") || Object.hasOwn(body, "workspaceIds");
+        if (shouldRevoke) {
+          sessions.deleteByUser(user.id);
+          liveSockets.drop(user.id);
+        }
+        return json(res, 200, { user });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+    if (userAction && req.method === "DELETE") {
+      try {
+        const user = store.removeUser(userAction[1]);
+        sessions.deleteByUser(user.id);
+        liveSockets.drop(user.id);
+        transfers?.removeUserUploads(user.id);
+        return json(res, 200, { ok: true, user });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    const kickAction = url.pathname.match(/^\/admin\/api\/users\/([^/]+)\/kick$/);
+    if (kickAction && req.method === "POST") {
+      const user = store.user(kickAction[1]);
+      if (!user) return json(res, 404, { error: "用户不存在" });
+      const dropped = kickLiveSession({ sessions, sockets: liveSockets }, user.id);
+      return json(res, 200, { ok: true, ...dropped });
+    }
+
+    return json(res, 404, { error: "not found" });
+  }
+
+  async function handleWorkspace(req, res, route) {
+    const workspace = store.workspace(route.id);
+    if (!workspace) return json(res, 404, { error: "工作区不存在" });
+
+    if (route.suffix === "/api/bootstrap" && req.method === "GET") {
+      const session = workspaceSession(req, route.id);
+      return json(res, 200, {
+        authenticated: !!session,
+        user: session?.user || null,
+        workspace: session ? publicWorkspace(workspace) : { id: workspace.id, name: workspace.name },
+        browser: session ? broker.status() : undefined,
+        fileTransfer: session && transfers
+          ? { enabled: true, maxFileBytes: transfers.maxFileBytes }
+          : { enabled: false },
+        sensitivePolicyEnabled: session ? store.sensitivePolicy().enabled : undefined,
+      });
+    }
+
+    if (route.suffix === "/login" && req.method === "POST") {
+      const body = await readBody(req);
+      const key = `workspace|${clientIp(req)}|${limiterUsername(body.username)}`;
+      if (limiter.blocked(key)) return json(res, 429, { error: "尝试次数过多，请稍后再试" });
+      const user = store.login(body.username, body.password);
+      if (!user || !store.canOpen(user, route.id)) {
+        limiter.fail(key);
+        return json(res, 401, { error: "用户名、密码或工作区权限错误" });
+      }
+      limiter.ok(key);
+      createLogin(req, res, user, { kind: "workspace", workspaceId: route.id });
+      return json(res, 200, { user, workspace: publicWorkspace(workspace) });
+    }
+
+    if (route.suffix === "/logout" && req.method === "POST") {
+      const session = workspaceSession(req, route.id);
+      if (session) sessions.delete(session.token);
+      setCookie(req, res, {
+        name: WORKSPACE_COOKIE,
+        value: "",
+        path: `/w/${route.id}`,
+        maxAge: 0,
+      });
+      return json(res, 200, { ok: true });
+    }
+
+    const session = workspaceSession(req, route.id);
+    if (!session) return json(res, 401, { error: "未登录" });
+
+    if (route.suffix === "/api/uploads" && req.method === "POST") {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        const entry = await transfers.receiveUpload(req, {
+          userId: session.user.id,
+          name: uploadName(req),
+          mimeType: req.headers["content-type"],
+          declaredSize: Number(req.headers["content-length"] || 0),
+        });
+        return json(res, 201, { file: entry });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    if (route.suffix === "/api/transfers" && req.method === "GET") {
+      if (!transfers) return json(res, 200, { files: [] });
+      return json(res, 200, {
+        files: transfers.listUserFiles({ workspaceId: route.id, userId: session.user.id }),
+      });
+    }
+
+    const transferAction = route.suffix.match(/^\/api\/transfers\/([a-zA-Z0-9-]{8,80})$/);
+    if (transferAction && req.method === "DELETE") {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        return json(res, 200, {
+          ok: true,
+          file: transfers.remove(transferAction[1], {
+            workspaceId: route.id,
+            userId: session.user.id,
+          }),
+        });
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.message });
+      }
+    }
+
+    const download = route.suffix.match(/^\/files\/([a-zA-Z0-9-]{8,80})$/);
+    if (download && (req.method === "GET" || req.method === "HEAD")) {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        return sendTransferFile(req, res, transfers.openDownload(download[1], { workspaceId: route.id }));
+      } catch (error) {
+        return json(res, error.status || 404, { error: error.message });
+      }
+    }
+
+    return json(res, 404, { error: "not found" });
+  }
+
+  function redirectMaintenance(req, res) {
+    if (!adminSession(req)) return json(res, 401, { error: "管理员未登录" });
+    res.writeHead(302, { location: maintenanceLocation(req), "cache-control": "no-store" });
+    res.end();
+  }
+
+  async function handle(req, res) {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method || "GET") && !originAllowed(req)) {
+      return json(res, 403, { error: "请求来源不受信任" });
+    }
+    if (url.pathname === "/healthz") {
+      return json(res, 200, { ok: true, browser: broker.status() });
+    }
+    if (/^\/admin\/maintenance\/?$/.test(url.pathname)) return redirectMaintenance(req, res);
+    if (
+      url.pathname.startsWith("/admin/") &&
+      (url.pathname.includes("/api/") || url.pathname.startsWith("/admin/files/") || /\/(login|logout|setup)$/.test(url.pathname))
+    ) {
+      return handleAdmin(req, res, url);
+    }
+    const route = workspaceRoute(url.pathname);
+    if (
+      route &&
+      (route.suffix.includes("/api/") || route.suffix.startsWith("/files/") || ["/login", "/logout"].includes(route.suffix))
+    ) {
+      return handleWorkspace(req, res, route);
+    }
+    if (["/app.js", "/app.css", "/text-input.js"].includes(url.pathname)) {
+      serveFile(webDir, res, url.pathname);
+      return;
+    }
+    if (url.pathname === "/" || url.pathname === "/admin" || url.pathname === "/admin/" || route?.suffix === "/") {
+      serveFile(webDir, res, "/");
+      return;
+    }
+    res.writeHead(302, { location: "/", "cache-control": "no-store" });
+    res.end();
+  }
+
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((error) => {
+      logger.error?.(error);
+      if (!res.headersSent) json(res, error.status || 500, { error: error.status ? error.message : "internal error" });
+    });
+  });
+
+  async function handleMaintenance(req, res) {
+    if (!adminSession(req)) {
+      res.writeHead(401, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+      res.end("请先在主网关登录管理员");
+      return;
+    }
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (req.method === "GET" && url.pathname === "/__gpc/admin-browser.js") {
+      serveFile(webDir, res, "/admin-browser.js");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/") {
+      await broker.focusMaintenance();
+      res.writeHead(302, { location: "/vnc/", "cache-control": "no-store" });
       res.end();
       return;
     }
-    if (url.pathname === "/" || url.pathname.startsWith("/app")) {
-      serveStatic(res, "/");
-      return;
-    }
-    res.writeHead(302, { location: "/" });
-    res.end();
-    return;
+    maintenanceProxy.web(req, res, { target: maintenanceTarget });
   }
-  const deskId = parseCookie(req.headers.cookie)[DESK];
-  const desk = deskId && registry.get(deskId);
-  if (!desk || !users.canOpen(sess.user, desk.id)) {
-    if (serveStatic(res, "/")) return;
-    json(res, 403, { error: "请先选择账号" });
-    return;
-  }
-  proxy.web(req, res, { target: desk.target });
-}
 
-const server = http.createServer((req, res) => {
-  handle(req, res).catch((err) => {
-    if (err?.message === "body too large") {
-      if (!res.headersSent) json(res, 413, { error: "请求体太大" });
-      return;
-    }
-    console.error(err);
-    if (!res.headersSent) json(res, 500, { error: "internal error" });
+  const maintenanceServer = http.createServer((req, res) => {
+    handleMaintenance(req, res).catch((error) => {
+      logger.error?.(`管理员浏览器置前失败：${error.message}`);
+      if (!res.headersSent) {
+        res.writeHead(503, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        res.end("管理员浏览器窗口不可用");
+      }
+    });
   });
-});
 
-server.on("upgrade", (req, socket, head) => {
-  const sess = getSession(req);
-  if (!sess) {
-    socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-  const deskId = parseCookie(req.headers.cookie)[DESK];
-  const desk = deskId && registry.get(deskId);
-  if (!desk || !users.canOpen(sess.user, desk.id)) {
-    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-  if (VNC_PASSWORD) {
-    req.headers.authorization = `Basic ${Buffer.from(`${VNC_USER}:${VNC_PASSWORD}`).toString("base64")}`;
-  }
-  liveSockets.add(sess.user.id, socket);
-  proxy.ws(req, socket, head, { target: desk.target });
-});
+  webSockets.on("connection", (socket, _request, context) => {
+    const { workspaceId, user } = context;
+    liveSockets.add(user.id, socket);
+    let queue = Promise.resolve();
+    let queuedCommands = 0;
+    socket.on("message", (data, isBinary) => {
+      if (isBinary) {
+        socket.close(1003, "只接受 JSON 输入");
+        return;
+      }
+      let command;
+      try {
+        command = JSON.parse(data.toString());
+      } catch {
+        socket.send(JSON.stringify({ type: "error", message: "输入消息不是 JSON" }));
+        return;
+      }
+      queuedCommands += 1;
+      if (queuedCommands > 128) {
+        socket.close(1008, "输入过快");
+        return;
+      }
+      queue = queue
+        .then(() => broker.handleCommand(workspaceId, command, user, socket))
+        .catch((error) => {
+          if (socket.readyState === 1) socket.send(JSON.stringify({ type: "error", message: error.message }));
+        })
+        .finally(() => {
+          queuedCommands -= 1;
+        });
+    });
+    socket.on("close", () => broker.removeViewer(workspaceId, socket));
+    socket.on("error", () => broker.removeViewer(workspaceId, socket));
+    broker.addViewer(workspaceId, socket).catch((error) => {
+      if (socket.readyState === 1) socket.close(1011, error.message.slice(0, 120));
+    });
+  });
 
-async function reconcileExtraDesks() {
-  const extras = users.extraDeskIds();
-  if (!extras.length) return;
-  for (const id of extras) {
-    try {
-      await ensureDeskContainer(id, docker);
-      console.log(`desk ${id}: container ready`);
-    } catch (e) {
-      console.error(`desk ${id}: ${e.message}`);
+  server.on("upgrade", (req, socket, head) => {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (!originAllowed(req)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
     }
-  }
+    const route = workspaceRoute(url.pathname);
+    if (!route || route.suffix !== "/socket" || !WORKSPACE_ID_RE.test(route.id)) {
+      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const session = workspaceSession(req, route.id);
+    if (!session) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    webSockets.handleUpgrade(req, socket, head, (webSocket) => {
+      webSockets.emit("connection", webSocket, req, { workspaceId: route.id, user: session.user });
+    });
+  });
+
+  maintenanceServer.on("upgrade", async (req, socket, head) => {
+    if (!originAllowed(req) || !adminSession(req)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    maintenanceSockets.add(socket);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      maintenanceSockets.delete(socket);
+      if (!maintenanceSockets.size) broker.setMaintenanceActive(false);
+    };
+    socket.once("close", release);
+    socket.once("error", release);
+    try {
+      await broker.setMaintenanceActive(true);
+    } catch (error) {
+      release();
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      logger.error?.(`管理员浏览器置前失败：${error.message}`);
+      return;
+    }
+    if (socket.destroyed) return;
+    if (vncPassword) {
+      req.headers.authorization = `Basic ${Buffer.from(`${vncUser}:${vncPassword}`).toString("base64")}`;
+    }
+    maintenanceProxy.ws(req, socket, head, { target: maintenanceTarget });
+  });
+
+  const heartbeat = setInterval(() => {
+    for (const socket of webSockets.clients) {
+      if (socket.isAlive === false) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }, 30000);
+  heartbeat.unref?.();
+  webSockets.on("connection", (socket) => {
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+  });
+
+  return {
+    server,
+    maintenanceServer,
+    broker,
+    async start(port = 8080, host = "0.0.0.0", maintenancePort = 0) {
+      await new Promise((resolveStart, reject) => {
+        server.once("error", reject);
+        server.listen(port, host, resolveStart);
+      });
+      try {
+        await new Promise((resolveStart, reject) => {
+          maintenanceServer.once("error", reject);
+          maintenanceServer.listen(maintenancePort, host, resolveStart);
+        });
+      } catch (error) {
+        await new Promise((resolveStop) => server.close(resolveStop));
+        throw error;
+      }
+      broker.start();
+      if (!store.browserProfile().configured && resolveBrowserProfile) {
+        try {
+          const result = await resolveBrowserProfile({ force: false });
+          if (result.warning) logger.warn?.(`${result.warning}${result.error ? ` ${result.error.message}` : ""}`);
+          const runtime = await broker.applyBrowserProfile({ reload: true });
+          if (runtime.failedTargets) {
+            logger.warn?.(`有 ${runtime.failedTargets} 个页面等待重连后应用浏览器环境`);
+          }
+        } catch (error) {
+          logger.warn?.(`初始化浏览器环境失败，可在管理页重试：${error.message}`);
+        }
+      }
+      return server.address();
+    },
+    async stop() {
+      clearInterval(heartbeat);
+      if (transferCleanup) clearInterval(transferCleanup);
+      for (const socket of maintenanceSockets) socket.destroy();
+      maintenanceSockets.clear();
+      broker.setMaintenanceActive(false);
+      broker.stop();
+      for (const socket of webSockets.clients) socket.terminate();
+      webSockets.close();
+      maintenanceProxy.close();
+      if (server.listening) await new Promise((resolveStop) => server.close(resolveStop));
+      if (maintenanceServer.listening) await new Promise((resolveStop) => maintenanceServer.close(resolveStop));
+    },
+  };
 }
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`gateway on :${PORT} desks=${registry.ids().join(",")}`);
-  reconcileExtraDesks();
-});
+export function createDefaultGateway(env = process.env) {
+  const stateFile = env.STATE_FILE || "/data/state.json";
+  const store = createStateStore({
+    file: stateFile,
+    adminUser: env.AUTH_USER || "admin",
+    adminPassword: String(env.AUTH_PASSWORD || ""),
+  });
+  const sessions = createSessionStore({
+    file: env.SESSIONS_FILE || join(dirname(stateFile), "sessions.json"),
+    ttlMs: SESSION_TTL_MS,
+  });
+  const transfers = createTransferStore({
+    root: env.TRANSFER_ROOT || "/transfer",
+    stateFile: env.TRANSFER_STATE_FILE || join(dirname(stateFile), "transfers.json"),
+    maxFileBytes: Number(env.MAX_FILE_BYTES || 512 * 1024 * 1024),
+    quotaBytes: Number(env.TRANSFER_QUOTA_BYTES || 4 * 1024 * 1024 * 1024),
+    ownerUid: Number(env.PUID || 1000),
+    ownerGid: Number(env.PGID || 1000),
+  });
+  const broker = new WorkspaceBroker({
+    store,
+    transferStore: transfers,
+    endpoint: env.DESKTOP_CDP || "http://desktop:9223",
+    frameFps: Number(env.FRAME_FPS || 8),
+    activeFrameFps: Number(env.FRAME_ACTIVE_FPS || 60),
+    idleFrameMs: Number(env.FRAME_IDLE_MS || 2000),
+    jpegQuality: Number(env.JPEG_QUALITY || 72),
+  });
+  const resolveBrowserProfile = async ({ force = false } = {}) => {
+    const current = store.browserProfile();
+    if (current.configured && !force) {
+      return { profile: current, detected: current.source === "ip", warning: current.lastDetectionError };
+    }
+    const result = await resolveAutomaticBrowserProfile({
+      autoDetect: force || enabled(env.PROFILE_AUTO_DETECT, true),
+      endpoint: env.PROFILE_GEO_ENDPOINT || "https://ipwho.is/?fields=success,country_code,timezone.id",
+      timeoutMs: Number(env.PROFILE_GEO_TIMEOUT_MS || 5000),
+      env,
+      fetchJson: (endpoint, options) => broker.loadPublicJson(endpoint, options),
+    });
+    return { ...result, profile: store.setBrowserProfile(result.profile) };
+  };
+  return createGateway({
+    store,
+    sessions,
+    broker,
+    transfers,
+    maintenanceTarget: env.DESKTOP_VNC || "http://desktop:3000",
+    maintenancePublicPort: Number(env.MAINTENANCE_PUBLIC_PORT || 36091),
+    maintenancePublicUrl: env.MAINTENANCE_PUBLIC_URL || "",
+    vncUser: env.VNC_USER || "abc",
+    vncPassword: env.VNC_PASSWORD || "",
+    resolveBrowserProfile,
+  });
+}
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+if (isMain) {
+  const app = createDefaultGateway();
+  const port = Number(process.env.PORT || 8080);
+  const maintenancePort = Number(process.env.MAINTENANCE_LISTEN_PORT || 8081);
+  app
+    .start(port, "0.0.0.0", maintenancePort)
+    .then(() => console.log(`GPT Pro 网关已监听 :${port}，管理员浏览器入口监听 :${maintenancePort}`))
+    .catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  const shutdown = () => app.stop().then(
+    () => process.exit(0),
+    (error) => {
+      console.error(error);
+      process.exit(1);
+    },
+  );
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+}

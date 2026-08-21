@@ -1,0 +1,12 @@
+.git
+.env
+.DS_Store
+.playwright-cli
+data
+data-panel
+data-transfer
+node_modules
+tmp
+*.log
+__pycache__
+*.pyc

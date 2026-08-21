@@ -1,13 +1,12 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="GPT-Pro Cloud —— 把已登录的 ChatGPT Pro 跑在自己的机器上" width="100%">
+<img src="assets/hero.svg" alt="GPT Pro——一份已登录的 Chromium Profile 与多个独立工作区 Target" width="100%">
 
-# GPT-Pro Cloud — 一个 Pro 席位，团队设备通用
+# GPT Pro——一个 Pro 登录，多个独立工作窗口
 
 [![Docker](https://img.shields.io/badge/docker-compose-2496ED?style=flat-square&logo=docker&logoColor=white)](docker-compose.yml)
 [![Node.js](https://img.shields.io/badge/node.js-22-339933?style=flat-square&logo=nodedotjs&logoColor=white)](gateway/)
-[![Chromium](https://img.shields.io/badge/chromium-kiosk-4587F3?style=flat-square&logo=googlechrome&logoColor=white)](docker/)
-[![KasmVNC](https://img.shields.io/badge/kasmvnc-web_desktop-5257CF?style=flat-square)](https://kasmweb.com/kasmvnc)
+[![Chromium](https://img.shields.io/badge/chromium-CDP-4587F3?style=flat-square&logo=googlechrome&logoColor=white)](docker/)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-178F5F?style=flat-square)](Deploy.md)
 [![License](https://img.shields.io/badge/license-MIT-1a1a18?style=flat-square)](LICENSE)
 
@@ -15,134 +14,175 @@
 
 </div>
 
----
+GPT Pro 在你控制的机器上运行一份持久化 Chromium Profile。你只登录一次 ChatGPT，然后按需创建任意数量的逻辑工作区。每个工作区都是一个独立顶层 Chromium 窗口中的 Page Target，拥有固定的网关地址、画面流与输入通道；所有窗口共享同一份 ChatGPT Cookie 与 Pro 权益。
 
-GPT-Pro Cloud 是一套 Docker 网关加浏览器桌面，把已登录的 ChatGPT 会话跑在你自己的机器上。它面向需要一个 Pro 席位随处可达的个人和小团队：无需安装客户端，也不必再登录一次。
+这个 fork 的主要场景是一位操作者在办公室、实验室、家里等多个地点使用同一个 Pro 账号，同时希望每个项目始终回到自己的页面，不被其它窗口打断。
 
-> **免责声明** —— 多人共用 ChatGPT 账号可能违反 OpenAI 的条款与政策。本仓库只提供自托管技术方案；是否使用、如何使用及一切后果由使用者自行承担，与本仓库无关。
+> **账号政策边界：**网关用户名只是本地访问与路由凭据，不是不同的 ChatGPT 身份。不同人员共用一个 ChatGPT 账号可能违反 OpenAI 的条款或政策；本软件不会让账号共享自动变得合规，也与 OpenAI 没有从属关系。
 
-<img src="assets/screenshot-home.jpg" alt="账号选择页：两张机器卡片显示实时在线状态、管理员标记和团队管理入口" width="100%">
+## 架构
 
-每个账号独占一个带持久化 profile 的 Chromium。一个网关提供登录、账号选择、团队管理和远程桌面——全部在浏览器里完成。
+```text
+客户端 /w/project-a/ ── 路径独立登录 ─┐
+客户端 /w/project-b/ ── 路径独立登录 ─┼─▶ gateway ─▶ CDP sessionId ─▶ 独立窗口 A / B / …
+客户端 /w/project-n/ ── 路径独立登录 ─┘                         │
+                                                                    ▼
+                                                   一只 Chromium 进程 + 一份 Profile
+                                                   一次 ChatGPT 登录 + 一套网络栈
 
-## 安装
+管理员 ─▶ /admin/maintenance/ ─▶ 完整 KasmVNC Chromium 浏览器
+```
 
-运行环境：Docker Compose（Linux 服务器；macOS / Windows 用 Docker Desktop），每个账号约 1 GB 内存。
+- 工作区和用户由持久化数据动态创建；主机资源允许时可继续增减。
+- 每个工作区 Target 会在自己的顶层窗口内写入运行标记。网关重启时认领现有窗口；Chromium 重启时按持久化的最后 URL 重建。
+- 客户端窗口使用 `/w/<workspace-id>/`。其 HttpOnly Cookie 只作用于这条路径，所以同一个本地浏览器 Profile 可以在不同工作区窗口同时登录不同的网关用户。
+- 鼠标、键盘和文本输入都携带当前工作区的 CDP `sessionId`；客户端拿不到原始 Target ID 或 DevTools 凭据。
+- 每个可见工作区独立启动 CDP 连续帧流，由 Chromium 主动推送 JPEG，不再逐帧调用截图命令，也不存在跨工作区的全局串行队列。命名 CDP 隔离环境中的轻量信号只观察 DOM 节点/文字、滚动、输入和尺寸活动，静止时抑制纯合成帧。源帧到达后立即确认，网关按真实经过时间执行前台与可见后台交付预算；没有可见观看者时停止流并最小化远端窗口。慢客户端只丢弃过期帧，静止画面复用最后一帧做保活，不会无界堆积缓冲。
+- 普通工作区 Target 加载管理员可配置的敏感操作黑名单：命中控件会隐藏，点击或键盘激活在网关发送 CDP `Input` 事件前再次检查，明确的 URL 黑名单由 Chromium 阻断。页面不再安装捕获阶段事件拦截器，普通文档请求也不会经 `Fetch` 暂停、继续或改写。DOM 变化只复核新增区域。账号、订阅、安全、全局设置与 ChatGPT 退出登录只在管理员浏览器操作。
+- 普通入口只显示项目画布、常驻的项目首页按钮和默认折叠的控制面板；网页端侧边栏、左上角项目名称/图标入口、项目菜单、分享、Chat/Work 切换、听写与语音入口会在受管页面隐藏。项目首页分享、对话分享和单条消息分享在输入发送前同时拒绝。管理员可逐行配置 `@` / `+` 功能白名单，规则按完整功能名匹配，不依赖位置或数量；默认只允许 `Add photos & files`、`Create image`、`Web search` 和 `Deep research`。Sources 的 Add sources 固定只保留 `Upload` 与 `Text input`。普通页面打开的新窗口会立即关闭，顶层页面也不能离开 `chatgpt.com`。起始地址是已识别的 ChatGPT 项目 URL 时，项目首页可以进入或新建项目对话，即使 ChatGPT 为对话路由分配了不同的 `g-p` 标识；进入某一对话后，只允许停留在该对话或通过常驻按钮返回配置的项目首页。该机制会修改 DOM/CSS，属于界面与权限收敛，不是“网页不可探查”或规避风控保证。
+- 管理员入口直接使用 KasmVNC 核心页面，不启动音频/文件包装层。Kasm 连接存续时会保持未受管的管理员 Chromium 窗口在最前，用于 ChatGPT 登录/退出、MFA、Profile 全局管理和 Chrome 扩展安装，不是普通工作区并发通道。
+- 本机上传只保存到当前用户的私人目录，不会自动交给 ChatGPT。用户在 ChatGPT 页面点击上传后，再从私人文件面板手动选择并确认。Chromium 下载也只经过独立传输目录；gateway 不挂载 Chromium Profile。
+- 时区、JavaScript 默认 locale、`navigator.languages` 和 HTTP `Accept-Language` 是唯一 Profile 的全局设置，所有 Target 与管理员浏览器保持一致。
+- 普通工作区把访问设备本机浏览器接收到的英文、中文、日文、韩文、表情、粘贴或其它最终文本直接提交给所属 Target；输入法候选和未完成组合始终留在本机。远端纯文本选区只映射到当前用户页面的隐藏输入框，因此原生 `Cmd/Ctrl+C` 与 `Cmd/Ctrl+X` 可以复制或剪切到访问设备的剪贴板。ChatGPT 消息复制按钮保持可见，并把产生的远端系统剪贴板文本交给点击它的本机窗口。管理员桌面直接启用 KasmVNC 的原生 IME Input Mode，不再叠加项目自建输入法。
+
+## 本机部署
+
+要求：Docker 与 Compose v2。macOS、Windows 可用 Docker Desktop，Linux Docker 主机也可运行。
 
 ```bash
-git clone https://github.com/JingxuanKang/GPT-Pro-Cloud.git
+git clone https://github.com/yueqingyou/GPT-Pro-Cloud.git
 cd GPT-Pro-Cloud
 cp .env.example .env
 ./scripts/up.sh
 ```
 
-内网访问走局域网或 Tailscale 这类 VPN（明文 HTTP）。公网访问用 Cloudflare Tunnel，且必须先建好管理员——见[公网访问](#公网访问)。
+打开 `http://127.0.0.1:36090/admin/`：
 
-## 快速开始
+1. 创建管理员；若已通过 `AUTH_PASSWORD` 预设，则直接登录。
+2. 核对“浏览器环境”。首次启动会按 Chromium 实际出口自动探测时区与语言；结果不合适时由管理员手动改写。
+3. 若 ChatGPT 已有 Projects，点击“读取 Projects”预览并导入所选；工作区名、用户名和初始密码使用项目名，冲突项不会覆盖。也可手动新增逻辑工作区。
+4. 按需手动新增本地用户并分配工作区。用户和工作区数量都不写死。
+5. 核对“`@` / `+` 功能白名单”。每行保存一个菜单显示的完整功能名；清空列表会禁用所有编辑器菜单功能。
+6. 核对“普通工作区敏感操作黑名单”。默认会把账号菜单、设置、退出登录、订阅、安全和破坏性全局操作保留给管理员。
+7. 登录 `/admin/` 后，在系统功能区点击“打开管理员浏览器”；只在这里登录一次 ChatGPT，并完成 MFA、退出登录与 Chrome 扩展管理。
+8. 打开或刷新每个工作区，把各自的 `/w/<id>/` 地址保存为地点专属书签。
 
-打开 `http://127.0.0.1:36090`（或局域网 / VPN 地址），首次访问会引导你创建管理员账号（也可以在 `.env` 里用 `AUTH_PASSWORD` 预设，适合自动化部署）。然后逐个打开账号卡片，在里面登录 ChatGPT——profile 跨重启保留，所以每个账号只需要做这一次。
+`./data/browser/` 保存唯一 Chromium Profile 与 ChatGPT 登录态；`./data-panel/state.json`、`sessions.json` 与 `transfers.json` 保存网关状态；`./data-transfer/` 保存按用户隔离的私人上传与 Chromium 下载。三个数据根均被 Git 忽略。
 
-之后同一内网里的任何设备打开同一个地址，进去就是已登录的会话。开公网隧道之前，先在本机或局域网建好管理员——否则陌生人打开公网地址就能抢注。
+## 多地点、多窗口如何使用
 
-## 公网访问
+例如管理员创建：
 
-公网入口是 Cloudflare Tunnel（HTTPS）。管理员必须已经存在（向导或 `AUTH_PASSWORD`），再开隧道。打开公网 URL 必须是登录页，不能是首次访问向导。
+| 网关地址 | 本地凭据 | Chromium Target |
+| --- | --- | --- |
+| `/w/office-project/` | `office-login` 与其密码 | 一个持久页面 |
+| `/w/lab-project/` | `lab-login` 与其密码 | 另一个持久页面 |
+| `/w/home-review/` | 任意获授权用户 | 再一个持久页面 |
 
-`.env` 里设 `BIND_ADDR=127.0.0.1`，避免面板同时以明文 HTTP 挂在公网网卡上，然后：
-
-```bash
-# 临时域名，不需要自己的域名
-cloudflared tunnel --url http://127.0.0.1:36090
-```
-
-把打印出的 `https://` 地址发出去。部署者用已建好的管理员登录；成员用「团队」页创建的网关用户名/密码，不是 ChatGPT 密码。
-
-要固定主机名，把 named tunnel 指到同一个本地端口（需要 Cloudflare 上有域名）。
-
-## 添加账号
-
-一个 ChatGPT 账号对应一个桌面容器。管理员在首页点 **添加 ChatGPT 账号**、起个名字，就会出现新卡片。打开后登录一次 ChatGPT，和 a / b 一样。
-
-网关通过 Docker Engine API 克隆 `desktop-a` 的镜像，接到同一 compose 网络（DNS `desktop-<id>`，卷 `./data/<id>:/config`）。额外账号写在 `data-panel/users.json`，容器 `restart: unless-stopped`，网关重启后不必改 `INSTANCES` 或 `docker-compose.yml`。
-
-一次宿主机配置：`docker-compose.yml` 把 `/var/run/docker.sock` 挂进 gateway。拉下这段改动后执行一次 `docker compose up -d` 让挂载生效。之后加号是面板操作，不要再 SSH 去复制 compose 服务。
-
-`INSTANCES` 和 `desktop-a` / `desktop-b` 仍是内置席位，不要删；新账号以 `desktop-a` 为模板克隆。
-
-Cloud / CI 虚拟机往往不跑桌面镜像，无法证明 Chromium 是活的。请在真实 Docker 宿主机（phoenix）上验证：面板里加一个账号、`docker ps` 能看到 `gpt-pro-cloud-<id>`、打开卡片并完成 ChatGPT 登录。
-
-## 团队与权限
-
-成员在「团队」页管理，该页仅管理员可见。
-
-| 目标 | 操作 |
-| --- | --- |
-| 新增成员 | 邀请后指定其可打开的账号 |
-| 重置凭证 | 重置该成员密码，其会话同时失效 |
-| 收回权限 | 停用或删除成员，在线会话立即断开 |
-| 查看占用 | 机器卡片按账号显示谁正在使用；「团队」页只作信息展示 |
-| 断开席位 | 在占用中的账号卡片上点「断开」，对方登录失效并离开桌面，需重新登录。账号还在 |
-| 删除额外账号 | 在面板添加的卡片上点「删除」，拆除容器并清掉 `./data/<id>`，再添加是干净的。内置 a / b 不能删 |
-
-密码以逐用户加盐的 scrypt 哈希存储。登录按 `ip|用户名` 限流（15 分钟 10 次），会话跨重启保留。
-
-## 剪贴板
-
-剪贴板在本机和桌面之间是双向的，文字和截图都可以。
-
-## 分享与记忆隔离
-
-分享对话有两条路。基础路径不依赖任何自动化：在页面里点 ChatGPT 自带的 Share 并复制，链接会经剪贴板链路自动落到你本机。开启**页面协助**后，顶栏会多一个「分享」按钮，由网关代点并直接把链接拷给你。
-
-记忆隔离解决"共用账号但不共用上下文"：开启页面协助后，成员第一次进入某个账号，网关会自动创建（或进入）一个以其用户名命名、设为**仅项目内记忆**的 ChatGPT 项目。项目内的对话不读写账号的全局记忆，成员之间互不泄漏上下文，每人的对话也归拢在各自的项目里。
-
-页面协助默认关闭。它靠 DevTools 选择器驱动 chatgpt.com，OpenAI 改版后可能失效；关掉时分享自己点、链接照样拷到本机，但不做自动进项目。
+三个地址可以同时开在同一个本地 Chromium Profile 中。登录 `/w/lab-project/` 不会覆盖 `/w/office-project/` 的 Cookie，输入也只发送给所选 Target。它们仍共享同一个远端 ChatGPT 登录，因为所有 Target 都在同一份远端 Profile 中。
 
 ## 配置
 
-全部配置在 `.env`，带注释的 [`.env.example`](.env.example) 就是参考。
+带注释的 [`.env.example`](.env.example) 是配置基准。
 
-| 配置项 | 作用 |
+| 变量 | 作用 |
 | --- | --- |
-| `AUTH_PASSWORD` | 可选：预设管理员密码，留空走首次访问向导 |
-| `INSTANCES` | compose 内置席位（`a,b`）。额外账号在面板里添加 |
-| `BIND_ADDR` | 网关监听地址；走隧道时填 `127.0.0.1`，内网则填局域网或 VPN 地址 |
-| `PROXY_URL_A`、`PROXY_URL_B` | 按账号出口代理的默认值；「设置」页里逐行保存或「全部应用」优先且立即生效 |
-| `PROXY_URL` | 所有账号共用的默认代理 |
+| `AUTH_USER` / `AUTH_PASSWORD` | 可选预建管理员；密码留空则使用首次访问向导 |
+| `BIND_ADDR` / `HTTP_PORT` | 网关发布地址与端口 |
+| `MAINTENANCE_BIND_ADDR` / `MAINTENANCE_PORT` | 仅管理员使用的完整 Chromium 浏览器监听，默认仅回环 `:36091` |
+| `MAINTENANCE_PUBLIC_URL` | 管理员浏览器使用独立 HTTPS 端口时填写完整公开地址；必须与普通入口使用同一主机名，以便 Host-only 管理员 Cookie 仍然可用 |
+| `PUID` / `PGID` / `TZ` | 桌面数据属主与容器启动时区；`TZ` 也是自动探测失败后使用的部署值 |
+| `START_URL` | 管理员浏览器的初始页面 |
+| `PROXY_URL` | Chromium 全局代理；宿主机回环地址会为 Docker 改写 |
+| `PROFILE_AUTO_DETECT` | 首次启动时是否按 Chromium 实际出口探测环境，默认 `true` |
+| `PROFILE_GEO_ENDPOINT` / `PROFILE_GEO_TIMEOUT_MS` | 允许浏览器 CORS 且返回时区与语言或国家代码的 HTTPS 端点与超时，默认 `https://ipwho.is/?fields=success,country_code,timezone.id` / `5000` |
+| `PROFILE_TIMEZONE` / `PROFILE_LOCALE` | 自动探测失败或被禁用时使用的可选部署值 |
+| `VNC_PASSWORD` | 内部管理员浏览器凭据；VNC 不发布到宿主机 |
+| `MAX_FILE_BYTES` / `TRANSFER_QUOTA_BYTES` | 单文件与整个传输目录的字节上限，默认 512 MiB / 4 GiB |
+| `FRAME_FPS` | 可见但未聚焦工作区的采样与交付上限，默认 `8` |
+| `FRAME_ACTIVE_FPS` | 聚焦或最近交互工作区的采样与交付上限，默认 `60` |
+| `FRAME_IDLE_MS` | 静止画面复用最后一帧的保活间隔，默认 `2000` 毫秒 |
+| `JPEG_QUALITY` | 画面流 JPEG 质量，范围 `35–90`，默认 `72` |
 
-代理只在服务器无法直连 ChatGPT 时需要（例如部署在中国大陆）；海外机器留空即可。前置条件是一个服务器可达的 `http://` / `https://` / `socks5://` 端点：宿主机上跑的代理客户端直接填 `http://127.0.0.1:7890` 这类回环地址，会自动改写为容器可达。
+所有 Target 共用同一只 Chromium 进程和网络栈，因此本版有意不支持按工作区设置不同代理。
 
-「设置」页的「全部应用」会把同一个地址写到每个 ChatGPT 账号，并走与逐行保存相同的即时下发（clipd / `--proxy-server`，浏览器会重启）。保存过的地址会留在上方，点一下即可再用，不用重新输入。
+## 浏览器环境一致性
 
-## 架构
+首次启动且还没有持久化设置时，网关会复用已有 CDP 连接，在临时 `about:blank` Target 中以 `credentials: omit` 和 `cache: no-store` 请求 `PROFILE_GEO_ENDPOINT`，读取后立即关闭 Target。它不会把用户页面导航到探测站点，也不会向提供商发送 Profile Cookie 或留下页面历史。因此探测看到的是 Chromium 的实际出口，设置 `PROXY_URL` 时也不会误用 gateway 容器的直连 IP。默认请求通过 `fields` 参数只要求国家代码和 IANA 时区，不要求返回公网 IP、城市或坐标；语言由国家代码与运行时 CLDR likely-subtags 推导。自定义提供商若仍返回额外字段，网关也不持久化或记录它们。探测服务仍会看到那次请求；不愿使用外部服务时设为 `PROFILE_AUTO_DETECT=false`。
 
-```
-浏览器 ──▶ gateway (:36090) ──▶ desktop-a / desktop-b / 额外桌面
-           登录 · 选账号 · 团队      Chromium --kiosk chatgpt.com
-```
+自动探测只在未设置的首次启动发生，之后不会因容器重启而自动改变浏览器环境。全局代理或部署地点变化后，管理员可点击“按出口 IP 重新探测”；也可直接填写例如 `Asia/Shanghai` 和 `zh-CN`。保存后网关将同一组设置应用到所有工作区和管理员浏览器，然后统一刷新。“核验当前页面”会实际读取页面的时区、locale、语言列表和 Client Hints 保留状态；任何未被网关认领的页面也会按不一致处理，而不是只复述状态文件。
 
-网关是唯一发布的端口。VNC 与 Chromium DevTools 留在容器网络里，从外部不可达。状态存在 `./data/`（Chromium profile）和 `./data-panel/`（成员、会话、设置），两者都被 gitignore，不出本机。
+IP 归属地提供的语言只是地区默认推断，不一定等于操作者偏好，所以管理页会显示完整结果供核对。这组设置只是减少明显的 IP、时区与语言不一致，不是“规避风控”或账号安全保证。稳定的出口、设备环境、使用节奏与账号合规仍需要操作者自行负责。
 
-## 安全
+## 当前交互能力
 
-面板走明文 HTTP，包括登录密码在内的所有流量都不加密，因此直连只适合局域网或 VPN。公网访问走 Cloudflare Tunnel 的 HTTPS，见[公网访问](#公网访问)。走隧道时 `BIND_ADDR=127.0.0.1`；有公网 IP 但仍走内网时绑局域网或 VPN 地址——不要在公网网卡上绑 `0.0.0.0`。
+普通工作区窗口支持：
 
-初始化向导只在还没有管理员时出现。请在本机或内网完成，或用 `AUTH_PASSWORD` 预设，然后再开隧道。
+- 相互独立的 JPEG 画面流；
+- 鼠标点击、拖动时的指针移动和滚轮；
+- 键盘导航、快捷键与文字输入；
+- 访问设备本机输入法产生的 Unicode 文本与原生粘贴；
+- 把当前远端纯文本选区原生复制或剪切到访问设备的剪贴板；
+- 通过 ChatGPT 消息复制按钮把远端系统剪贴板复制到触发操作的本机窗口；
+- 把本机文件保存到用户私人目录，并在 ChatGPT 手动打开文件选择后确认使用；
+- 在工作区文件面板中，把远端 Chromium 已完成的下载保存回本机；
+- 返回项目首页、页面刷新与浏览器全屏；
+- 默认折叠的控制面板；普通画面没有永久顶栏或底部提示，浏览器标题直接使用工作区名称。
 
-经隧道进来的请求，限流与审计使用 `CF-Connecting-IP`。
+当前限制：
 
-## 开发
+- 富文本、图片和文件剪贴板格式不会同步，选区与 ChatGPT 消息复制按钮只传输纯文本；
+- 音频、麦克风和 ChatGPT 语音模式尚未传输；
+- 同一工作区若同时有多个观看者，只共享一套 viewport；
+- Chromium 连续帧流仍消耗共享渲染器、JPEG 编码、CPU、RAM 与带宽；聚焦或最近交互窗口使用 `FRAME_ACTIVE_FPS`，可见后台窗口使用 `FRAME_FPS`，没有可见观看者时停止流；
+- 帧率配置是采样与交付上限而非实得帧率保证；多页同时变化时，共享 Chromium 的渲染和编码能力仍是上限；
+- 管理员安装的扩展运行在共享 Profile 中，可影响全部工作区；其权限、指纹行为和更新不属于本项目的安全保证。
+
+普通工作区 viewport 跟随访问页面的实际可用区域，手机竖屏不会套用桌面最小宽度；网关会将 Chromium 窗口恢复为普通状态，动态测量当前浏览器边框，再同步调整真实窗口和页面视口，画面与点击坐标始终铺满同一个画布。点击远端可编辑区域或取得非空远端文本选区后，网关才让当前页面的隐藏文本框获得本机浏览器焦点，点击 Chat、Sources 等普通控件不会唤起输入法。可打印字符、dead key、本机粘贴以及 IME 组合都由访问设备的操作系统和浏览器处理；候选更新产生的中间 `insertCompositionText` 不发送，只有最终确认文本才通过当前工作区的 CDP `sessionId` 和 `Input.insertText` 注入远端。Enter、Backspace、方向键和远端快捷键仍走键盘事件通道，因此 ChatGPT 的发送、换行、删除和导航语义不变。
+
+项目不定义输入源切换快捷键，也不保存语言模式、拼音缓冲或候选词。每个本地浏览器页面拥有自己的组合状态；一个窗口正在选词不会改变另一个窗口。鼠标或键盘选区完成后，远端纯文本只映射到当前窗口的隐藏输入框；`Cmd/Ctrl+C`、`Cmd/Ctrl+X` 与 `Cmd/Ctrl+V` 均使用访问设备浏览器的原生剪贴板事件，项目不程序化读取本机剪贴板。所有普通 Target 共用一份远端系统剪贴板，因此 ChatGPT 原生复制操作按全局顺序执行；远端监听只运行在 CDP 隔离环境，每次结果只返回触发它的窗口。macOS 本机的 `Command` 组合按远端 `Control` 语义发送，其它平台继续把本机 `Control` 发送为远端 `Control`。管理员浏览器使用 KasmVNC 官方 IME Input Mode，把同一访问设备的系统输入法直接交给远端桌面。当前真实事件序列以 Chromium 系浏览器为验收目标。
+
+需要浏览器地址栏、标签栏、原生桌面对话框或共享 Profile 管理时，使用管理员浏览器；不要把它当作普通用户入口开放。
+
+## 安全边界
+
+- 只有 gateway 进程向宿主机发布端口。普通入口为 `:36090`；由于 KasmVNC 必须使用原生根路径，同一网关另设默认仅回环的 `:36091` 管理员浏览器监听。desktop 容器、Chromium DevTools 与原始 KasmVNC 端口仍只在私有网络内。
+- 网关不再挂载 `/var/run/docker.sock`。
+- 密码使用逐用户随机盐的 scrypt 摘要；状态和会话文件以当前用户私有权限创建。
+- 登录有限流。修改密码、停用用户或调整工作区授权时，会撤销该用户现有会话和 WebSocket。
+- Projects 导入只捕获共享 Profile 中 ChatGPT 页面发出的已授权侧栏响应，不读取或重放登录令牌；列表需要分页或结构变化时会拒绝导入。
+- 按完整名称匹配的编辑器功能白名单和敏感操作黑名单都会持久化，只作用于受管普通工作区 Target；分享限制是不可由普通用户关闭的固定规则，管理员浏览器不受影响。网站文字、DOM 和端点可能变化，ChatGPT 大幅改版后应复核这些规则。
+- 隐藏并阻止未列入白名单的 ChatGPT app 不是第三方 OAuth 授权的账号级撤销；要取消已存在的 GitHub、Notion、Gmail 等连接，仍应由管理员在 ChatGPT `Settings > Apps` 执行 Disconnect。
+- 私人上传只对所属用户可见；本机上传不触发网页文件控件，只处理用户在 ChatGPT 手动打开并确认的那一次选择。下载只允许所属工作区或管理员取回。文件名、单文件和总容量均受约束。
+- 有副作用的 HTTP 请求与 WebSocket 升级会拒绝跨站 Origin。
+- 状态、会话或文件传输索引 JSON 损坏时失败关闭，不会静默重置权限数据。
+- 明文 HTTP 只适合可信局域网或 VPN。任何公网入口都应通过反向代理或隧道提供 HTTPS，并把 `BIND_ADDR` 设为 `127.0.0.1`。
+- 对外开放前先在可信网络完成管理员初始化；尚无管理员时，首位访问者可以认领初始化。
+
+## 容量与资源
+
+程序没有“两工作区”限制，也没有人为写死的最大值。每个工作区使用独立顶层窗口和独立 `Page.startScreencast` 流；网关为每个工作区只保留一份最后画面，服务端背压与客户端只解码最新帧让慢链路不会无界占用内存。画面配置按可见工作区数量自适应：一个窗口最高 `2560×1600`，二至四个为 `1280×800`，五至八个为 `960×600`，九个及以上为 `800×500`；JPEG 质量上限依次为 90、70、66、60，并继续受 `JPEG_QUALITY` 限制。
+
+当前维护的回归基线是十二个本地用户各绑定一个工作区，配置为 `FRAME_FPS=8`、`FRAME_ACTIVE_FPS=60`、`FRAME_IDLE_MS=2000`、`JPEG_QUALITY=72`。参考 Docker 主机上，单个动态普通窗口实得 38.30 FPS、0.87 MiB/s；六前台加六可见后台分别实得 10.33–11.07 FPS 与 7.47–7.73 FPS，总带宽 0.83 MiB/s；十二前台各实得 9.20–11.60 FPS，总带宽 0.95 MiB/s，网关背压丢帧为 0。十二前台时 desktop 约为 172–192% CPU、1.17–1.26 GiB，gateway 越过建连尖峰后约为 11–14% CPU、63–71 MiB。静止窗口七秒只发送四帧保活画面，同时抑制十一帧纯合成画面。`FRAME_ACTIVE_FPS=60` 仍只是上限：一只 headful Chromium 不能让十二个操作系统后台窗口拥有十二只独立前台浏览器进程的渲染速率。这些合成结果不等于十二个真实已登录 ChatGPT 对话的容量承诺。
+
+## 验证与开发
 
 ```bash
-docker compose up -d --build
-docker compose logs -f gateway
+npm ci
+npm test
+npm audit --omit=dev
+docker compose --env-file .env.example config --quiet
+docker compose up -d --build --wait
+curl -fsS http://127.0.0.1:36090/healthz
 ```
 
-网关是 Node 22，没有构建步骤。`docker/` 是桌面镜像，Chromium 版本钉死在 Dockerfile 里——升级时改那里，不要在运行时覆盖。[Deploy.md](Deploy.md) 覆盖部署、回滚、健康检查和日志位置。
+自动化测试覆盖十二用户动态配置、Projects 预览与原子批量导入、权限隔离、路径会话、本机文本、输入法、选区隔离与原生复制并发归属、按完整名称匹配的编辑器功能白名单、敏感操作守卫、分享与项目链接的输入前拒绝、返回项目首页、十二个独立窗口连续流与慢客户端背压、CDP Target/session 路由、上传/下载授权、网关重启后的 Target 认领、全局时区/语言应用、出口探测失败处理、CSRF/Origin 拒绝与 Compose 结构。运行时验收还需要真实 Docker/Chromium 主机。完整 ChatGPT Pro 端到端验收必须由操作者执行那一次获授权的 ChatGPT 登录；仓库不会内置或自动填写凭据。
+
+部署、数据、健康检查与恢复细节见 [Deploy.md](Deploy.md)。
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。基于 [KasmVNC](https://kasmweb.com/kasmvnc) 与 [LinuxServer.io](https://www.linuxserver.io/) 基础镜像构建。与 OpenAI 无从属关系；ChatGPT 是 OpenAI 的商标。
+MIT，见 [LICENSE](LICENSE)。基于 [KasmVNC](https://kasmweb.com/kasmvnc) 与 [LinuxServer.io](https://www.linuxserver.io/) 基础镜像构建。ChatGPT 是 OpenAI 的商标。
 
 ## 友情链接
 

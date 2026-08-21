@@ -1,31 +1,3 @@
-# GPT-Pro on Cloud —— 独立产品。
-# gateway 是唯一入口；desktop-a / desktop-b 是内置席位。额外账号在面板里添加，
-# 由 gateway 经 docker.sock 克隆同一桌面镜像，不必再改这份 compose。
-
-x-desktop-env: &desktop-env
-  PUID: ${PUID:-1000}
-  PGID: ${PGID:-1000}
-  TZ: ${TZ:-Asia/Shanghai}
-  CUSTOM_USER: abc
-  PASSWORD: ${VNC_PASSWORD:-gpc-internal}
-  TITLE: GPT Pro
-  START_URL: ${START_URL:-https://chatgpt.com}
-  PROXY_URL: ${PROXY_URL:-}
-  LIBGL_ALWAYS_SOFTWARE: "1"
-
-x-desktop: &desktop
-  build: ./docker
-  image: gpt-pro-cloud-desktop:local
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
-  shm_size: "1gb"
-  restart: unless-stopped
-  logging:
-    driver: json-file
-    options:
-      max-size: "20m"
-      max-file: "2"
-
 services:
   gateway:
     build:
@@ -34,47 +6,87 @@ services:
     image: gpt-pro-cloud-gateway:local
     container_name: gpt-pro-cloud-gateway
     environment:
-      - PORT=8080
-      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
-      - AUTH_USER=${AUTH_USER:-admin}
-      - USERS_FILE=/data/users.json
-      - INSTANCES=${INSTANCES:-a,b}
-      - VNC_USER=abc
-      - VNC_PASSWORD=${VNC_PASSWORD:-gpc-internal}
-      # 面板「添加账号」通过 Engine API 克隆 desktop-a；一次配置：挂上 docker.sock
-      - DESKTOP_TEMPLATE=gpt-pro-cloud-a
-      - DOCKER_SOCKET=/var/run/docker.sock
+      PORT: "8080"
+      AUTH_USER: ${AUTH_USER:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      STATE_FILE: /data/state.json
+      SESSIONS_FILE: /data/sessions.json
+      DESKTOP_CDP: http://desktop:9223
+      DESKTOP_VNC: http://desktop:3000
+      MAINTENANCE_LISTEN_PORT: "8081"
+      MAINTENANCE_PUBLIC_PORT: ${MAINTENANCE_PORT:-36091}
+      MAINTENANCE_PUBLIC_URL: ${MAINTENANCE_PUBLIC_URL:-}
+      VNC_USER: abc
+      VNC_PASSWORD: ${VNC_PASSWORD:-gpc-internal}
+      FRAME_FPS: ${FRAME_FPS:-8}
+      FRAME_ACTIVE_FPS: ${FRAME_ACTIVE_FPS:-60}
+      FRAME_IDLE_MS: ${FRAME_IDLE_MS:-2000}
+      JPEG_QUALITY: ${JPEG_QUALITY:-72}
+      TRANSFER_ROOT: /transfer
+      TRANSFER_STATE_FILE: /data/transfers.json
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-536870912}
+      TRANSFER_QUOTA_BYTES: ${TRANSFER_QUOTA_BYTES:-4294967296}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Asia/Shanghai}
+      PROFILE_AUTO_DETECT: ${PROFILE_AUTO_DETECT:-true}
+      PROFILE_GEO_ENDPOINT: ${PROFILE_GEO_ENDPOINT:-https://ipwho.is/?fields=success,country_code,timezone.id}
+      PROFILE_GEO_TIMEOUT_MS: ${PROFILE_GEO_TIMEOUT_MS:-5000}
+      PROFILE_TIMEZONE: ${PROFILE_TIMEZONE:-}
+      PROFILE_LOCALE: ${PROFILE_LOCALE:-}
     volumes:
       - ./data-panel:/data
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data-transfer:/transfer
     ports:
       - "${BIND_ADDR:-0.0.0.0}:${HTTP_PORT:-36090}:8080"
+      - "${MAINTENANCE_BIND_ADDR:-127.0.0.1}:${MAINTENANCE_PORT:-36091}:8081"
     depends_on:
-      - desktop-a
-      - desktop-b
+      desktop:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "2"
 
-  desktop-a:
-    <<: *desktop
-    container_name: gpt-pro-cloud-a
+  desktop:
+    build: ./docker
+    image: gpt-pro-cloud-desktop:local
+    container_name: gpt-pro-cloud-desktop
     environment:
-      <<: *desktop-env
-      # 本账号专属出口代理，留空则用全局 PROXY_URL
-      PROXY_URL_OVERRIDE: ${PROXY_URL_A:-}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Asia/Shanghai}
+      CUSTOM_USER: abc
+      PASSWORD: ${VNC_PASSWORD:-gpc-internal}
+      TITLE: GPT Pro
+      START_URL: ${START_URL:-https://chatgpt.com}
+      PROXY_URL: ${PROXY_URL:-}
+      GPC_CDP_ALLOW: gateway,gpt-pro-cloud-gateway
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      NO_DECOR: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ./data/a:/config
-    # Chromium DevTools 不映射到宿主机，只在 compose 网里给 gateway 用。
-
-  desktop-b:
-    <<: *desktop
-    container_name: gpt-pro-cloud-b
-    environment:
-      <<: *desktop-env
-      PROXY_URL_OVERRIDE: ${PROXY_URL_B:-}
-    volumes:
-      - ./data/b:/config
+      - ./data/browser:/config
+      - ./data-transfer:/transfer
+    shm_size: "1gb"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9222/json/version >/dev/null"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"

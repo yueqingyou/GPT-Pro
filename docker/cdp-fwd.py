@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Forward 9223 -> 127.0.0.1:9222. Only the gateway may connect; not published to the host."""
 import os
 import re
 import socket
@@ -7,8 +6,12 @@ import threading
 
 LISTEN = ("0.0.0.0", 9223)
 TARGET = ("127.0.0.1", 9222)
-HOST_RE = re.compile(br"(?i)host:\s*[^\r\n]+")
-ALLOWED_NAMES = ("gateway", "gpt-pro-cloud-gateway")
+HOST_RE = re.compile(rb"(?im)^host:\s*[^\r\n]+")
+ALLOWED_NAMES = tuple(
+    name.strip() for name in os.environ["GPC_CDP_ALLOW"].split(",") if name.strip()
+)
+if not ALLOWED_NAMES:
+    raise RuntimeError("GPC_CDP_ALLOW 不能为空")
 
 
 def peer_ip(addr):
@@ -19,12 +22,8 @@ def peer_ip(addr):
 
 
 def allowed(peer):
-    names = list(ALLOWED_NAMES)
-    extra = os.environ.get("GPC_CDP_ALLOW", "")
-    if extra:
-        names.extend(x.strip() for x in extra.split(",") if x.strip())
     ips = set()
-    for name in names:
+    for name in ALLOWED_NAMES:
         try:
             for item in socket.getaddrinfo(name, None):
                 ips.add(item[4][0])
@@ -34,9 +33,25 @@ def allowed(peer):
 
 
 def rewrite_host(data: bytes) -> bytes:
-    if not (data.startswith(b"GET ") or data.startswith(b"POST ") or data.startswith(b"HEAD ")):
+    if not (
+        data.startswith(b"GET ")
+        or data.startswith(b"POST ")
+        or data.startswith(b"HEAD ")
+    ):
         return data
     return HOST_RE.sub(b"Host: 127.0.0.1:9222", data, count=1)
+
+
+def read_request(client) -> bytes:
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = client.recv(65536 - len(data))
+        if not chunk:
+            return b""
+        data.extend(chunk)
+        if len(data) == 65536 and b"\r\n\r\n" not in data:
+            raise OSError("HTTP 请求头过大")
+    return rewrite_host(bytes(data))
 
 
 def pipe(src, dst, first=None):
@@ -61,12 +76,17 @@ def pipe(src, dst, first=None):
 def handle(client):
     try:
         remote = socket.create_connection(TARGET, timeout=5)
+        remote.settimeout(None)
     except OSError:
         client.close()
         return
     try:
-        first = rewrite_host(client.recv(65536))
+        first = read_request(client)
     except OSError:
+        client.close()
+        remote.close()
+        return
+    if not first:
         client.close()
         remote.close()
         return

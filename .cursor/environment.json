@@ -1,15 +1,15 @@
 {
-  "name": "GPT-Pro Cloud",
+  "name": "GPT Pro",
   "user": "ubuntu",
-  "install": "cd gateway && npm install",
+  "install": "npm ci",
   "ports": [
     { "name": "gateway", "port": 8080 }
   ],
   "terminals": [
     {
       "name": "gateway",
-      "description": "GPT-Pro Cloud gateway (panel, login, account picker, team management) on http://localhost:8080. Uses the AUTH_PASSWORD secret when set, otherwise a dev fallback. The KasmVNC desktop containers require Docker + a manual ChatGPT login and are not started here.",
-      "command": "AUTH_PASSWORD=\"${AUTH_PASSWORD:-devpass}\" AUTH_USER=\"${AUTH_USER:-admin}\" PORT=8080 INSTANCES=\"${INSTANCES:-a,b}\" USERS_FILE=/workspace/data-panel/users.json node gateway/server.mjs"
+      "description": "Gateway-only preview on http://localhost:8080. It can manage dynamic users and workspaces, but screen streaming and the one persistent Chromium profile still require the Docker Compose desktop service.",
+      "command": "mkdir -p /workspace/data-panel /workspace/data-transfer && STATE_FILE=/workspace/data-panel/state.json SESSIONS_FILE=/workspace/data-panel/sessions.json TRANSFER_STATE_FILE=/workspace/data-panel/transfers.json TRANSFER_ROOT=/workspace/data-transfer PROFILE_AUTO_DETECT=false PORT=8080 MAINTENANCE_LISTEN_PORT=8081 node gateway/server.mjs"
     }
   ]
 }
