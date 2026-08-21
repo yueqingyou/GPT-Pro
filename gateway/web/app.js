@@ -980,7 +980,8 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   };
   const nativeInput = attachNativeTextInput({
     input: keyCapture,
-    commitText: (text) => send({ type: "text", text }),
+    commitText: (text, { paste = false } = {}) =>
+      send({ type: "text", text, ...(paste ? { paste: true } : {}) }),
   });
 
   const sendViewerState = () => {

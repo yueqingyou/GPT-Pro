@@ -176,6 +176,8 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(textInput, /compositionstart/);
   assert.match(textInput, /compositionend/);
   assert.match(textInput, /insertFromPaste|commitText/);
+  assert.match(textInput, /paste: event\.inputType === "insertFromPaste"/);
+  assert.match(client, /paste \? \{ paste: true \}/);
   assert.match(textInput, /event\.isComposing/);
   assert.match(textInput, /macOS && event\.metaKey/);
   const index = read("gateway/web/index.html");

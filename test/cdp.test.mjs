@@ -82,6 +82,9 @@ class FakeConnection extends EventEmitter {
       if (params.expression.includes("globalThis.getSelection")) {
         return { result: { value: "远端选区" } };
       }
+      if (params.expression.includes("navigator.clipboard.writeText")) {
+        return { result: { value: true } };
+      }
       return { result: { value: params.expression.includes("sessionStorage.setItem") ? true : "" } };
     }
     return {};
@@ -521,6 +524,57 @@ test("选区只返回当前窗口并以 Chromium 编辑命令执行剪切", asyn
         (call) => call.method === "Input.dispatchKeyEvent" && call.params.type === "rawKeyDown" && call.params.commands[0] === "Cut",
       ),
     );
+  } finally {
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+class NativePasteConnection extends FakeConnection {
+  constructor() {
+    super("native-paste");
+    this.activeWrites = 0;
+    this.maxActiveWrites = 0;
+  }
+
+  async call(method, params = {}, sessionId) {
+    if (method === "Runtime.evaluate" && params.expression.includes("navigator.clipboard.writeText")) {
+      this.calls.push({ method, params, sessionId });
+      this.activeWrites += 1;
+      this.maxActiveWrites = Math.max(this.maxActiveWrites, this.activeWrites);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      this.activeWrites -= 1;
+      return { result: { value: true } };
+    }
+    return super.call(method, params, sessionId);
+  }
+}
+
+test("多窗口本机粘贴经远端原生粘贴事务全局顺序提交", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-native-paste-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  for (const id of ["left", "right"]) {
+    store.createWorkspace({ id, name: id, startUrl: "https://chatgpt.com/" });
+  }
+  const connection = new NativePasteConnection();
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const text = "段落\n".repeat(1000);
+  try {
+    await Promise.all([
+      broker.handleCommand("left", { type: "text", text, paste: true }),
+      broker.handleCommand("right", { type: "text", text, paste: true }),
+    ]);
+    assert.equal(connection.maxActiveWrites, 1);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.insertText").length, 0);
+    const writes = connection.calls.filter(
+      (call) => call.method === "Runtime.evaluate" && call.params.expression.includes("navigator.clipboard.writeText"),
+    );
+    assert.equal(writes.length, 2);
+    assert.ok(writes.every((call) => Number.isInteger(call.params.contextId)));
+    const paste = connection.calls.filter(
+      (call) => call.method === "Input.dispatchKeyEvent" && call.params.commands?.[0] === "Paste",
+    );
+    assert.equal(paste.length, 2);
   } finally {
     broker.stop();
     rmSync(directory, { recursive: true, force: true });

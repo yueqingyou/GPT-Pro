@@ -17,7 +17,7 @@
 - 普通客户端不得直接访问 Chromium DevTools、VNC 内部凭据、Docker Socket 或其它工作区的页面目标。
 - 用户名、密码、ChatGPT Cookie、Profile、会话令牌、代理凭据和真实项目 URL 不得写入仓库、测试快照、日志或可提交样例。
 - 本地网关密码按用户要求不设最短长度；仍须拒绝空白密码和超过 256 字符的输入，界面、预设管理员与用户管理路径必须使用同一规则。
-- 普通工作区必须把访问设备本机浏览器产生的可打印文本、dead key、粘贴和 IME 组合留在本机处理，只在 `compositionend` 或非组合 `input` 后通过所属 CDP `sessionId` 提交最终文本；候选中间值不得发送。远端纯文本选区只允许映射到发起选区请求的本地窗口，`Cmd/Ctrl+C` 与 `Cmd/Ctrl+X` 使用该窗口的浏览器原生剪贴板事件，禁止跨用户广播或程序化读取本机剪贴板。ChatGPT 原生消息复制按钮必须保留；按钮写入远端系统剪贴板后，由一个跨工作区全局原子队列按 `clipboardchange` 顺序读取，并且只写入触发按钮的本机窗口剪贴板，不得轮询或按时间猜测归属。macOS 的本机 `Command` 组合必须映射为远端 `Control`，其它平台的本机 `Control` 继续映射为远端 `Control`；本机复制、剪切和粘贴快捷键仍由本机浏览器处理。Enter、删除、导航和其它远端快捷键继续走键盘事件。管理员完整桌面只启用 KasmVNC 原生 IME Input Mode，不得再叠加语言按钮、内置词典、候选服务、Fcitx 或项目自定义切换快捷键。
+- 普通工作区必须把访问设备本机浏览器产生的可打印文本、dead key、粘贴和 IME 组合留在本机处理；候选中间值不得发送。普通文字和 `compositionend` 的确认文本通过所属 CDP `sessionId` 的 `Input.insertText` 提交；本机 `insertFromPaste` 文本必须经跨工作区全局原子队列写入远端 Chromium 剪贴板并执行一次原生 Paste，不得把大段多行粘贴交给单次或循环 `Input.insertText`。远端纯文本选区只允许映射到发起选区请求的本地窗口，`Cmd/Ctrl+C` 与 `Cmd/Ctrl+X` 使用该窗口的浏览器原生剪贴板事件，禁止跨用户广播或程序化读取本机剪贴板。ChatGPT 原生消息复制按钮必须保留；按钮写入远端系统剪贴板后，由同一队列按 `clipboardchange` 顺序读取，并且只写入触发按钮的本机窗口剪贴板，不得轮询或按时间猜测归属。macOS 的本机 `Command` 组合必须映射为远端 `Control`，其它平台的本机 `Control` 继续映射为远端 `Control`；本机复制、剪切和粘贴快捷键仍由本机浏览器处理。Enter、删除、导航和其它远端快捷键继续走键盘事件。管理员完整桌面只启用 KasmVNC 原生 IME Input Mode，不得再叠加语言按钮、内置词典、候选服务、Fcitx 或项目自定义切换快捷键。
 
 ## 实现原则
 

@@ -2,12 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_COMPOSER_TOOL_ALLOWLIST,
+  composerMenuFromElement,
   normalizeComposerToolAllowlist,
   projectFocusScript,
   projectNavigationAllowed,
   projectRestrictedActionMatch,
   projectScopeFromUrl,
 } from "../lib/focus.mjs";
+
+test("桌面编辑器弹层按展开的加号按钮归属识别", () => {
+  const trigger = {};
+  const menu = {
+    parentElement: {
+      querySelector: (selector) => (selector.includes("composer-plus-btn") ? trigger : null),
+    },
+    closest: (selector) => (selector === ".popover" ? menu : null),
+    querySelector: (selector) => (selector === ".__menu-item" ? {} : null),
+  };
+  assert.equal(composerMenuFromElement(menu), menu);
+  menu.parentElement.querySelector = () => null;
+  assert.equal(composerMenuFromElement(menu), null);
+});
 
 test("项目 URL 生成主文档导航 allowlist", () => {
   const home = "https://chatgpt.com/g/g-p-project123/project";
@@ -50,6 +65,8 @@ test("编辑器功能白名单保存具体名称而不依赖位置", () => {
   assert.match(source, /\.truncate, \.line-clamp-1/);
   assert.match(source, /data-gpc-composer-tool-hidden/);
   assert.match(source, /composer-plus-btn/);
+  assert.match(source, /aria-expanded/);
+  assert.match(source, /aria-controls/);
   assert.match(source, /add sources/);
   assert.match(source, /text input/);
   const custom = projectFocusScript(["GitHub"]);
@@ -128,6 +145,15 @@ test("项目固定限制只按实测控件属性和项目首页 URL 匹配", () 
   );
   assert.equal(projectRestrictedActionMatch(scope, { tagName: "button", ariaLabel: "Shared files" }), "");
   assert.equal(projectRestrictedActionMatch(scope, { tagName: "button", ariaLabel: "More" }), "");
+  assert.equal(
+    projectRestrictedActionMatch(scope, {
+      tagName: "div",
+      role: "",
+      surface: "composer-tool",
+      controlName: "Vercel",
+    }),
+    "workspace tool",
+  );
   assert.equal(
     projectRestrictedActionMatch(scope, {
       tagName: "div",

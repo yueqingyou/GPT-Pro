@@ -44,14 +44,17 @@ function emit(input, type, values = {}) {
 test("英文、中文、表情与粘贴文本直接提交本机浏览器输出", () => {
   const input = new FakeInput();
   const committed = [];
-  attachNativeTextInput({ input, commitText: (text) => committed.push(text) });
+  attachNativeTextInput({ input, commitText: (text, options) => committed.push({ text, options }) });
 
   input.value = "Ab!";
   emit(input, "input", { inputType: "insertText", data: "Ab!", isComposing: false });
   input.value = "🙂中文\n第二行";
   emit(input, "input", { inputType: "insertFromPaste", data: null, isComposing: false });
 
-  assert.deepEqual(committed, ["Ab!", "🙂中文\n第二行"]);
+  assert.deepEqual(committed, [
+    { text: "Ab!", options: { paste: false } },
+    { text: "🙂中文\n第二行", options: { paste: true } },
+  ]);
   assert.equal(input.value, "");
 });
 

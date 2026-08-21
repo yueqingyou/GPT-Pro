@@ -77,7 +77,7 @@ export function attachNativeTextInput({ input, commitText }) {
     if (composing || event.isComposing) return;
     const text = String(input.value || "");
     clear();
-    if (text) commitText(text);
+    if (text) commitText(text, { paste: event.inputType === "insertFromPaste" });
   };
 
   clear();
