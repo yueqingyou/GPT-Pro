@@ -1,4 +1,30 @@
 services:
+  https:
+    build:
+      context: .
+      dockerfile: caddy/Dockerfile
+    image: gpt-pro-cloud-caddy:local
+    container_name: gpt-pro-cloud-caddy
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST?请在 .env 中设置 PUBLIC_HOST}
+      TENCENTCLOUD_SECRET_ID: ${TENCENTCLOUD_SECRET_ID?请在 .env 中设置 TENCENTCLOUD_SECRET_ID}
+      TENCENTCLOUD_SECRET_KEY: ${TENCENTCLOUD_SECRET_KEY?请在 .env 中设置 TENCENTCLOUD_SECRET_KEY}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "443:443"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
   gateway:
     build:
       context: .
@@ -14,13 +40,10 @@ services:
       DESKTOP_CDP: http://desktop:9223
       DESKTOP_VNC: http://desktop:3000
       MAINTENANCE_LISTEN_PORT: "8081"
-      MAINTENANCE_PUBLIC_PORT: ${MAINTENANCE_PORT:-36091}
-      MAINTENANCE_PUBLIC_URL: ${MAINTENANCE_PUBLIC_URL:-}
+      MAINTENANCE_HOST_PORT: ${MAINTENANCE_PORT:-36091}
       VNC_USER: abc
       VNC_PASSWORD: ${VNC_PASSWORD:-gpc-internal}
-      FRAME_FPS: ${FRAME_FPS:-8}
       FRAME_ACTIVE_FPS: ${FRAME_ACTIVE_FPS:-60}
-      FRAME_IDLE_MS: ${FRAME_IDLE_MS:-2000}
       JPEG_QUALITY: ${JPEG_QUALITY:-72}
       TRANSFER_ROOT: /transfer
       TRANSFER_STATE_FILE: /data/transfers.json
@@ -38,8 +61,8 @@ services:
       - ./data-panel:/data
       - ./data-transfer:/transfer
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${HTTP_PORT:-36090}:8080"
-      - "${MAINTENANCE_BIND_ADDR:-127.0.0.1}:${MAINTENANCE_PORT:-36091}:8081"
+      - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-36090}:8080"
+      - "127.0.0.1:${MAINTENANCE_PORT:-36091}:8081"
     depends_on:
       desktop:
         condition: service_healthy
@@ -90,3 +113,7 @@ services:
       options:
         max-size: "20m"
         max-file: "2"
+
+volumes:
+  caddy-data:
+  caddy-config:

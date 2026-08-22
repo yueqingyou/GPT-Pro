@@ -12,9 +12,31 @@ test("Compose 只保留一个桌面 Profile 且不挂 Docker Socket", () => {
   assert.match(compose, /PROFILE_AUTO_DETECT:/);
   assert.match(compose, /PROFILE_GEO_ENDPOINT:/);
   assert.match(compose, /FRAME_ACTIVE_FPS:/);
+  assert.match(compose, /- "127\.0\.0\.1:\$\{MAINTENANCE_PORT:-36091\}:8081"/);
+  assert.doesNotMatch(compose, /MAINTENANCE_(?:BIND_ADDR|PUBLIC_URL|PUBLIC_PORT)/);
+  assert.doesNotMatch(compose, /^\s+FRAME_FPS:/m);
+  assert.doesNotMatch(compose, /^\s+FRAME_IDLE_MS:/m);
   assert.match(compose, /\.\/data-transfer:\/transfer/g);
   assert.doesNotMatch(compose, /docker\.sock/);
   assert.equal((compose.match(/^  desktop:\s*$/gm) || []).length, 1);
+});
+
+test("普通入口使用 DNSPod DNS-01 的单一 HTTPS 反向代理", () => {
+  const compose = read("docker-compose.yml");
+  const caddyfile = read("caddy/Caddyfile");
+  const dockerfile = read("caddy/Dockerfile");
+  assert.match(compose, /^  https:\n/m);
+  assert.match(compose, /- "443:443"/);
+  assert.match(compose, /\$\{BIND_ADDR:-127\.0\.0\.1\}:\$\{HTTP_PORT:-36090\}:8080/);
+  assert.match(compose, /TENCENTCLOUD_SECRET_ID: \$\{TENCENTCLOUD_SECRET_ID\?/);
+  assert.match(compose, /TENCENTCLOUD_SECRET_KEY: \$\{TENCENTCLOUD_SECRET_KEY\?/);
+  assert.match(caddyfile, /dns tencentcloud/);
+  assert.match(caddyfile, /reverse_proxy gateway:8080/);
+  assert.match(caddyfile, /auto_https disable_redirects/);
+  assert.match(caddyfile, /protocols h1 h2/);
+  assert.doesNotMatch(caddyfile, /secret_(?:id|key)\s+[^\{]/);
+  assert.match(dockerfile, /caddy:2\.11\.4-builder/);
+  assert.match(dockerfile, /github\.com\/caddy-dns\/tencentcloud@v0\.4\.3/);
 });
 
 test("Docker 构建上下文排除凭据、Profile 与实验产物", () => {
@@ -27,7 +49,9 @@ test("Docker 构建上下文排除凭据、Profile 与实验产物", () => {
 test("启动脚本只在容器健康后打印入口", () => {
   const script = read("scripts/up.sh");
   assert.match(script, /docker compose up -d --build --wait/);
-  assert.ok(script.indexOf("--wait") < script.indexOf('echo "入口：'));
+  assert.match(script, /TENCENTCLOUD_SECRET_ID:\?/);
+  assert.match(script, /TENCENTCLOUD_SECRET_KEY:\?/);
+  assert.ok(script.indexOf("--wait") < script.indexOf('echo "普通入口：'));
 });
 
 test("云开发预览使用动态状态且没有内置回退密码", () => {
@@ -68,11 +92,14 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(cdp, /Browser\.setDownloadBehavior/);
   assert.match(cdp, /Page\.startScreencast/);
   assert.match(cdp, /Page\.screencastFrameAck/);
-  assert.match(cdp, /globalThis\[binding\]\(""\)/);
+  assert.match(cdp, /__gpcNotification/);
+  assert.match(cdp, /new Proxy\(NativeNotification/);
+  assert.match(cdp, /type: "notification"/);
   assert.match(cdp, /captureMode: "target-screencast"/);
   assert.match(cdp, /newWindow: true/);
   assert.doesNotMatch(cdp, /Page\.captureScreenshot/);
   assert.match(cdp, /activeFrameFps/);
+  assert.doesNotMatch(cdp, /gpc-visual-activity|visualActiveUntil|idleFrames|heartbeatFrames/);
   assert.match(cdp, /SCREENCAST_TIERS/);
   assert.match(cdp, /streamTier/);
   assert.doesNotMatch(cdp, /Target\.activateTarget/);
@@ -95,14 +122,30 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.doesNotMatch(focus, /stopImmediatePropagation|preventDefault/);
   assert.doesNotMatch(policy, /stopImmediatePropagation|preventDefault/);
   const client = read("gateway/web/app.js");
+  const server = read("gateway/server.mjs");
   const styles = read("gateway/web/app.css");
   const textInput = read("gateway/web/text-input.js");
   assert.match(client, /type: "viewerState"/);
   assert.match(client, /visibilitychange/);
+  assert.doesNotMatch(client, /document\.hasFocus|addEventListener\("focus"|addEventListener\("blur"/);
   assert.match(client, /attachNativeTextInput/);
   assert.match(client, /type: "selection"/);
   assert.match(client, /type: "cut"/);
   assert.match(client, /payload\.type === "clipboard"/);
+  assert.match(client, /payload\.type === "notification"/);
+  assert.match(client, /class: "viewer-notification"/);
+  assert.match(client, /const IN_PAGE_NOTICE_MS = 5000/);
+  assert.match(client, /new BrowserNotification\(title, \{ body \}\)/);
+  assert.match(client, /BrowserNotification\.permission !== "granted"/);
+  assert.match(client, /BrowserNotification\.requestPermission\(\)/);
+  assert.match(client, /viewer\.addEventListener\("click", requestBrowserNotifications, \{ once: true \}\)/);
+  assert.doesNotMatch(client, /button\("开启浏览器通知"/);
+  assert.match(client, /deliverNotice\("下载完成", `\$\{payload\.file\.name\} 已保存到私人文件区`\)/);
+  assert.match(client, /deliverNotice\("下载失败", `\$\{payload\.file\.name\}：\$\{payload\.file\.error\}`\)/);
+  assert.match(client, /deliverNotice\(payload\.title \|\| "ChatGPT 通知", payload\.body\)/);
+  assert.match(client, /setTimeout\(dismissNotice, IN_PAGE_NOTICE_MS\)/);
+  assert.match(client, /document\.title = `● \$\{workspace\.name\}`/);
+  assert.doesNotMatch(server, /notifications\.js/);
   assert.match(client, /payload\.type === "input-target"/);
   assert.match(client, /copyClipboardText/);
   assert.match(client, /button: pressedPointerButton\(event\.buttons\)/);
@@ -116,6 +159,13 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(cdp, /Page\.createIsolatedWorld/);
   assert.match(cdp, /worldName: "gpc-clipboard"/);
   assert.match(client, /viewer-control-panel/);
+  assert.match(client, /class: "viewer-toolbar"/);
+  assert.match(client, /menuToggle\.setPointerCapture/);
+  assert.match(client, /toolbar\.style\.left/);
+  assert.match(client, /localStorage\.setItem\(toolbarPositionKey/);
+  assert.match(client, /localStorage\.getItem\(toolbarPositionKey\)/);
+  assert.match(client, /gpc\.viewerToolbarPosition\.\$\{workspace\.id\}/);
+  assert.doesNotMatch(client, /viewer-toolbar-drag|viewer-toolbar-grip|dragHandle/);
   assert.match(client, /viewer-status-icon/);
   assert.match(client, /viewer-menu-icon/);
   assert.match(client, /button\("项目首页"/);
@@ -125,11 +175,18 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /button\("退出登录"/);
   assert.match(
     client,
-    /viewer-panel-actions" \}, upload, uploadInput, downloads, fullscreen, reload, logout/,
+    /upload,\n\s+uploadInput,\n\s+downloads,\n\s+fullscreen,\n\s+reload,\n\s+logout/,
   );
-  assert.match(client, /stage, homeButton, menuToggle, controlPanel/);
+  assert.match(client, /stage,\n\s+notificationNotice,\n\s+toolbar,\n\s+keyCapture/);
   assert.doesNotMatch(client, /button\("文件"|button\("全屏"|button\("退出本地工作区"/);
   assert.match(styles, /\.viewer-home-button/);
+  assert.match(styles, /\.viewer-notification/);
+  assert.match(styles, /\.viewer-notification \{[^}]*top: 14px;[^}]*right: 14px;/s);
+  assert.match(styles, /\.viewer-notification > span:not\(\.viewer-notification-close\)[^{]*\{[^}]*overflow-wrap: anywhere;/s);
+  assert.match(styles, /\.viewer-toolbar \{\n\s+position: fixed;\n\s+z-index: 40;\n\s+top: 72px/);
+  assert.doesNotMatch(styles, /viewer-toolbar-drag|viewer-toolbar-grip/);
+  assert.match(styles, /\.viewer-control-panel \{\n\s+position: absolute;/);
+  assert.match(styles, /\.viewer-transfer-panel \{\n\s+position: absolute;/);
   assert.doesNotMatch(styles, /object-fit:\s*contain/);
   assert.match(cdp, /MIN_VIEWPORT_WIDTH = 320/);
   assert.match(cdp, /MIN_VIEWPORT_HEIGHT = 240/);
@@ -157,6 +214,7 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /button\("登出"/);
   assert.match(client, /class: "admin-system-panel"/);
   assert.match(client, /href: "\/admin\/maintenance\/"/);
+  assert.match(client, /rel: "noopener noreferrer"/);
   assert.match(client, /打开管理员浏览器/);
   assert.match(client, /replace\(shell\("管理", "", content\)\)/);
   assert.match(client, /"details",\n\s+\{ class: "item-card item-details" \}/);

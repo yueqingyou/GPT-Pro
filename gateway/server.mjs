@@ -16,7 +16,10 @@ const DEFAULT_WEB = join(HERE, "web");
 const ADMIN_COOKIE = "gpc_admin_session";
 const WORKSPACE_COOKIE = "gpc_workspace_session";
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_HANDOFF_TTL_MS = 30 * 1000;
 const BODY_LIMIT = 64 * 1024;
+const MAINTENANCE_HANDOFF_PAGE =
+  '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/vnc/"><title>GPT Pro</title>';
 
 const CSP = [
   "default-src 'self'",
@@ -200,8 +203,7 @@ export function createGateway({
   transfers = null,
   webDir = DEFAULT_WEB,
   maintenanceTarget = "http://desktop:3000",
-  maintenancePublicPort = 36091,
-  maintenancePublicUrl = "",
+  maintenanceHostPort = 36091,
   vncUser = "abc",
   vncPassword = "",
   resolveBrowserProfile,
@@ -214,6 +216,7 @@ export function createGateway({
   const webSockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false });
   const maintenanceProxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true, xfwd: true });
   const maintenanceSockets = new Set();
+  const maintenanceHandoffs = new Map();
   const transferCleanup = transfers
     ? setInterval(() => {
         try {
@@ -245,16 +248,8 @@ export function createGateway({
     }
   });
 
-  function maintenanceLocation(req) {
-    if (maintenancePublicUrl) return new URL("/", maintenancePublicUrl).toString();
-    const protocol = String(req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
-    const forwardedHost = String(req.headers["x-forwarded-host"] || req.headers.host || "localhost").split(",")[0].trim();
-    const location = new URL(`${protocol}://${forwardedHost}`);
-    location.port = String(maintenancePublicPort);
-    location.pathname = "/";
-    location.search = "";
-    location.hash = "";
-    return location.toString();
+  function maintenanceLocation(handoff) {
+    return `http://127.0.0.1:${maintenanceHostPort}/?handoff=${handoff}`;
   }
 
   function sessionRecord(req, cookieName) {
@@ -686,8 +681,19 @@ export function createGateway({
   }
 
   function redirectMaintenance(req, res) {
-    if (!adminSession(req)) return json(res, 401, { error: "管理员未登录" });
-    res.writeHead(302, { location: maintenanceLocation(req), "cache-control": "no-store" });
+    const session = adminSession(req);
+    if (!session) return json(res, 401, { error: "管理员未登录" });
+    const now = Date.now();
+    for (const [handoff, record] of maintenanceHandoffs) {
+      if (record.expires <= now) maintenanceHandoffs.delete(handoff);
+    }
+    const handoff = createSessionToken();
+    maintenanceHandoffs.set(handoff, { sessionToken: session.token, expires: now + MAINTENANCE_HANDOFF_TTL_MS });
+    res.writeHead(302, {
+      location: maintenanceLocation(handoff),
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+    });
     res.end();
   }
 
@@ -733,12 +739,45 @@ export function createGateway({
   });
 
   async function handleMaintenance(req, res) {
-    if (!adminSession(req)) {
-      res.writeHead(401, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
-      res.end("请先在主网关登录管理员");
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const handoff = url.searchParams.get("handoff");
+    if (req.method === "GET" && url.pathname === "/" && handoff) {
+      const record = maintenanceHandoffs.get(handoff);
+      maintenanceHandoffs.delete(handoff);
+      const session = record?.expires > Date.now()
+        ? readSession(sessions, record.sessionToken, Date.now(), SESSION_TTL_MS)
+        : null;
+      const user = session?.kind === "admin" ? store.user(session.userId) : null;
+      if (!user || user.disabled || user.role !== "admin") {
+        res.writeHead(401, {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+        });
+        res.end("管理员浏览器入口已失效，请从管理页重新打开");
+        return;
+      }
+      setCookie(req, res, {
+        name: ADMIN_COOKIE,
+        value: record.sessionToken,
+        path: "/",
+        maxAge: SESSION_TTL_MS / 1000,
+      });
+      await broker.focusMaintenance();
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "referrer-policy": "no-referrer",
+        "content-security-policy": "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      });
+      res.end(MAINTENANCE_HANDOFF_PAGE);
       return;
     }
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (!adminSession(req)) {
+      res.writeHead(401, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+      res.end("请从管理页点击“打开管理员浏览器”");
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/__gpc/admin-browser.js") {
       serveFile(webDir, res, "/admin-browser.js");
       return;
@@ -946,9 +985,7 @@ export function createDefaultGateway(env = process.env) {
     store,
     transferStore: transfers,
     endpoint: env.DESKTOP_CDP || "http://desktop:9223",
-    frameFps: Number(env.FRAME_FPS || 8),
     activeFrameFps: Number(env.FRAME_ACTIVE_FPS || 60),
-    idleFrameMs: Number(env.FRAME_IDLE_MS || 2000),
     jpegQuality: Number(env.JPEG_QUALITY || 72),
   });
   const resolveBrowserProfile = async ({ force = false } = {}) => {
@@ -971,8 +1008,7 @@ export function createDefaultGateway(env = process.env) {
     broker,
     transfers,
     maintenanceTarget: env.DESKTOP_VNC || "http://desktop:3000",
-    maintenancePublicPort: Number(env.MAINTENANCE_PUBLIC_PORT || 36091),
-    maintenancePublicUrl: env.MAINTENANCE_PUBLIC_URL || "",
+    maintenanceHostPort: Number(env.MAINTENANCE_HOST_PORT || 36091),
     vncUser: env.VNC_USER || "abc",
     vncPassword: env.VNC_PASSWORD || "",
     resolveBrowserProfile,

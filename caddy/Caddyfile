@@ -1,0 +1,17 @@
+{
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$PUBLIC_HOST} {
+	tls {
+		dns tencentcloud {
+			secret_id {env.TENCENTCLOUD_SECRET_ID}
+			secret_key {env.TENCENTCLOUD_SECRET_KEY}
+		}
+	}
+
+	reverse_proxy gateway:8080
+}

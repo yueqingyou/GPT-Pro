@@ -853,11 +853,62 @@ a {
   cursor: default;
 }
 
-.viewer-home-button,
-.viewer-menu-toggle {
+.viewer-notification {
+  position: fixed;
+  z-index: 41;
+  top: 14px;
+  right: 14px;
+  display: grid;
+  width: min(420px, calc(100vw - 28px));
+  min-width: 0;
+  gap: 3px;
+  border: 1px solid #b7dfd2;
+  border-radius: 13px;
+  background: rgb(244 252 249 / 98%);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 14%);
+  color: var(--ink);
+  cursor: pointer;
+  padding: 11px 64px 11px 13px;
+  text-align: left;
+}
+
+.viewer-notification strong {
+  overflow: hidden;
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-notification > span:not(.viewer-notification-close) {
+  color: var(--muted);
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+
+.viewer-notification-close {
+  position: absolute;
+  top: 50%;
+  right: 13px;
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 600;
+  transform: translateY(-50%);
+}
+
+.viewer-toolbar {
   position: fixed;
   z-index: 40;
-  top: 14px;
+  top: 72px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.viewer-home-button,
+.viewer-menu-toggle {
+  position: static;
   height: 36px;
   align-items: center;
   justify-content: center;
@@ -870,7 +921,6 @@ a {
 }
 
 .viewer-home-button {
-  right: 58px;
   display: flex;
   padding: 0 12px;
   font-size: 0.8rem;
@@ -878,10 +928,10 @@ a {
 }
 
 .viewer-menu-toggle {
-  right: 14px;
   display: grid;
   width: 36px;
   place-items: center;
+  touch-action: none;
 }
 
 .viewer-home-button:hover,
@@ -919,10 +969,10 @@ a {
 }
 
 .viewer-control-panel {
-  position: fixed;
+  position: absolute;
   z-index: 39;
-  top: 58px;
-  right: 14px;
+  top: 44px;
+  right: 0;
   width: min(336px, calc(100vw - 28px));
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -987,10 +1037,10 @@ a {
 }
 
 .viewer-transfer-panel {
-  position: fixed;
+  position: absolute;
   z-index: 39;
-  top: 58px;
-  right: 14px;
+  top: 44px;
+  right: 0;
   width: min(430px, calc(100vw - 28px));
   max-height: calc(100dvh - 68px);
   overflow: auto;

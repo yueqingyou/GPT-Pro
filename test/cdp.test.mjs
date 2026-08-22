@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import { CdpConnection, WorkspaceBroker } from "../lib/cdp.mjs";
 import { manualBrowserProfile } from "../lib/profile.mjs";
 import { createStateStore } from "../lib/store.mjs";
@@ -437,22 +438,6 @@ test("输入坐标和文本长度在服务端校验", async () => {
     await broker.handleCommand("only", { type: "resize", width: 390, height: 844 });
     assert.ok(
       connection.calls.some(
-        (call) =>
-          call.method === "Runtime.addBinding" &&
-          call.params.name === "__gpcVisualActivity" &&
-          call.params.executionContextName === "gpc-visual-activity",
-      ),
-    );
-    assert.ok(
-      connection.calls.some(
-        (call) =>
-          call.method === "Page.addScriptToEvaluateOnNewDocument" &&
-          call.params.worldName === "gpc-visual-activity" &&
-          call.params.runImmediately === true,
-      ),
-    );
-    assert.ok(
-      connection.calls.some(
         (call) => call.method === "Browser.setWindowBounds" && call.params.bounds.windowState === "normal",
       ),
     );
@@ -486,6 +471,89 @@ test("输入坐标和文本长度在服务端校验", async () => {
     });
     await assert.rejects(() => broker.handleCommand("only", { type: "text", text: "x".repeat(10001) }), /过长/);
   } finally {
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ChatGPT 原生网页通知只转发到所属工作区", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-notification-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({ id: "office", name: "Office", startUrl: "https://chatgpt.com/g/office" });
+  store.createWorkspace({ id: "lab", name: "Lab", startUrl: "https://chatgpt.com/g/lab" });
+  const connection = new FakeConnection("notification");
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const createViewer = () => ({
+    readyState: 1,
+    bufferedAmount: 0,
+    messages: [],
+    send(payload, options = {}) {
+      if (!options.binary) this.messages.push(JSON.parse(payload));
+    },
+    close() {
+      this.readyState = 3;
+    },
+  });
+  const officeViewer = createViewer();
+  const labViewer = createViewer();
+  try {
+    await broker.addViewer("office", officeViewer);
+    await broker.addViewer("lab", labViewer);
+    const notificationScripts = connection.calls.filter(
+      (call) =>
+        call.method === "Page.addScriptToEvaluateOnNewDocument" &&
+        call.params.source.includes("__gpcNotificationRelayInstalled"),
+    );
+    assert.equal(notificationScripts.length, 2);
+    assert.ok(notificationScripts.every((call) => call.params.runImmediately === true));
+    assert.ok(notificationScripts.every((call) => !("worldName" in call.params)));
+    assert.equal(
+      connection.calls.filter(
+        (call) => call.method === "Runtime.addBinding" && call.params.name === "__gpcNotification",
+      ).length,
+      2,
+    );
+
+    const relayed = [];
+    class NativeNotification {
+      static permission = "granted";
+      constructor(title, options) {
+        this.title = title;
+        this.body = options.body;
+      }
+    }
+    const context = { Notification: NativeNotification, __gpcNotification: (payload) => relayed.push(JSON.parse(payload)) };
+    runInNewContext(notificationScripts[0].params.source, context);
+    const native = new context.Notification("研究已完成", { body: "结果可以查看" });
+    assert.ok(native instanceof NativeNotification);
+    assert.deepEqual(relayed, [{ title: "研究已完成", body: "结果可以查看" }]);
+
+    const officeSession = connection.calls.find(
+      (call) => call.method === "Page.navigate" && call.params.url === "https://chatgpt.com/g/office",
+    ).sessionId;
+    connection.emit("event", {
+      method: "Runtime.bindingCalled",
+      sessionId: officeSession,
+      params: {
+        name: "__gpcNotification",
+        payload: JSON.stringify({ title: "回答已完成", body: "请返回工作区查看" }),
+      },
+    });
+    assert.deepEqual(
+      officeViewer.messages.filter((message) => message.type === "notification"),
+      [{ type: "notification", title: "回答已完成", body: "请返回工作区查看" }],
+    );
+    assert.equal(labViewer.messages.some((message) => message.type === "notification"), false);
+
+    connection.emit("event", {
+      method: "Runtime.bindingCalled",
+      sessionId: officeSession,
+      params: { name: "__gpcNotification", payload: "invalid" },
+    });
+    assert.equal(officeViewer.messages.filter((message) => message.type === "notification").length, 1);
+  } finally {
+    broker.removeViewer("office", officeViewer);
+    broker.removeViewer("lab", labViewer);
     broker.stop();
     rmSync(directory, { recursive: true, force: true });
   }
@@ -917,9 +985,18 @@ class ProjectInputConnection extends FakeConnection {
   constructor() {
     super("project-focus");
     this.action = { description: "", tagName: "", ariaLabel: "", testId: "", href: "" };
+    this.failDownloadConversion = false;
   }
 
   async call(method, params = {}, sessionId) {
+    if (
+      this.failDownloadConversion &&
+      method === "Runtime.evaluate" &&
+      params.expression.includes('document.createElement("a")')
+    ) {
+      this.calls.push({ method, params, sessionId });
+      throw new Error("download conversion failed");
+    }
     if (method === "Runtime.evaluate" && params.expression.includes("inspectSensitiveAction")) {
       this.calls.push({ method, params, sessionId });
       return { result: { value: this.action } };
@@ -1026,6 +1103,181 @@ test("十二窗口短间隔原生复制按远端系统剪贴板全局顺序定�
       assert.deepEqual(clipboard, [{ type: "clipboard", text: `clipboard:project-focus-session-project-focus-target-${index + 2}` }]);
     }
   } finally {
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("普通工作区把明确下载动作转换为所属工作区的 Chromium 下载", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-download-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({ id: "project", name: "Project", startUrl: "https://chatgpt.com/g/project" });
+  const connection = new ProjectInputConnection();
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const viewer = {
+    readyState: 1,
+    bufferedAmount: 0,
+    messages: [],
+    send(payload, options = {}) {
+      if (!options.binary) this.messages.push(JSON.parse(payload));
+    },
+    close() {
+      this.readyState = 3;
+    },
+  };
+  try {
+    await broker.addViewer("project", viewer);
+    const runtime = await broker.ensureWorkspace("project");
+    connection.action = {
+      description: "Download",
+      tagName: "button",
+      ariaLabel: "Download",
+      testId: "",
+      href: "",
+      download: true,
+      downloadName: "实验结果.png",
+    };
+    await broker.handleCommand("project", {
+      type: "pointer",
+      event: "mousePressed",
+      x: 20,
+      y: 30,
+      button: "left",
+      buttons: 1,
+    });
+    const downloadUrl = "https://chatgpt.com/backend-api/estuary/content?id=file-test&sig=test";
+    connection.emit("event", {
+      method: "Page.frameScheduledNavigation",
+      sessionId: runtime.sessionId,
+      params: { frameId: runtime.mainFrameId, url: downloadUrl },
+    });
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    assert.ok(
+      connection.calls.some(
+        (call) => call.method === "Page.stopLoading" && call.sessionId === runtime.sessionId,
+      ),
+    );
+    const conversion = connection.calls.find(
+      (call) => call.method === "Runtime.evaluate" && call.params.expression.includes('document.createElement("a")'),
+    );
+    assert.equal(conversion.sessionId, runtime.sessionId);
+    assert.equal(conversion.params.userGesture, true);
+    assert.match(conversion.params.expression, /实验结果\.png/);
+    assert.match(conversion.params.expression, /backend-api\/estuary\/content/);
+
+    const stopsBeforeExternal = connection.calls.filter((call) => call.method === "Page.stopLoading").length;
+    await broker.handleCommand("project", {
+      type: "pointer",
+      event: "mousePressed",
+      x: 20,
+      y: 30,
+      button: "left",
+      buttons: 1,
+    });
+    connection.emit("event", {
+      method: "Page.frameScheduledNavigation",
+      sessionId: runtime.sessionId,
+      params: { frameId: runtime.mainFrameId, url: "https://example.com/private.bin" },
+    });
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    assert.equal(
+      connection.calls.filter((call) => call.method === "Page.stopLoading").length,
+      stopsBeforeExternal,
+    );
+
+    connection.failDownloadConversion = true;
+    await broker.handleCommand("project", {
+      type: "pointer",
+      event: "mousePressed",
+      x: 20,
+      y: 30,
+      button: "left",
+      buttons: 1,
+    });
+    connection.emit("event", {
+      method: "Page.frameScheduledNavigation",
+      sessionId: runtime.sessionId,
+      params: { frameId: runtime.mainFrameId, url: downloadUrl },
+    });
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    assert.deepEqual(
+      viewer.messages.filter((message) => message.type === "download").at(-1),
+      {
+        type: "download",
+        file: { name: "实验结果.png", state: "failed", error: "无法启动下载" },
+      },
+    );
+  } finally {
+    broker.removeViewer("project", viewer);
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Chromium 下载只在开始和结束时刷新普通页面文件状态", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-download-events-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({ id: "office", name: "Office", startUrl: "https://chatgpt.com/" });
+  const transferStore = {
+    downloadRoot: "/transfer/downloads",
+    beginDownload({ id, workspaceId, name }) {
+      return { id, workspaceId, name, kind: "download", state: "in_progress" };
+    },
+    updateDownload({ id, state }) {
+      return {
+        entry: {
+          id,
+          workspaceId: "office",
+          name: "report.pdf",
+          kind: "download",
+          state: state === "completed" ? "ready" : "in_progress",
+        },
+        cancel: false,
+        retry: false,
+        terminal: state === "completed",
+      };
+    },
+  };
+  const connection = new FakeConnection("download-events");
+  const broker = new WorkspaceBroker({
+    store,
+    transferStore,
+    connect: async () => connection,
+    logger: { warn() {}, error() {} },
+  });
+  const viewer = {
+    readyState: 1,
+    bufferedAmount: 0,
+    messages: [],
+    send(payload, options = {}) {
+      if (!options.binary) this.messages.push(JSON.parse(payload));
+    },
+    close() {
+      this.readyState = 3;
+    },
+  };
+  try {
+    await broker.addViewer("office", viewer);
+    const runtime = broker.runtimes.get("office");
+    runtime.downloadRequest = { name: "report.pdf" };
+    connection.emit("event", {
+      method: "Browser.downloadWillBegin",
+      params: { guid: "download-guid-1", frameId: runtime.mainFrameId, suggestedFilename: "report.pdf" },
+    });
+    assert.equal(runtime.downloadRequest, null);
+    connection.emit("event", {
+      method: "Browser.downloadProgress",
+      params: { guid: "download-guid-1", state: "inProgress", receivedBytes: 10, totalBytes: 100 },
+    });
+    assert.equal(viewer.messages.filter((message) => message.type === "download").length, 1);
+    connection.emit("event", {
+      method: "Browser.downloadProgress",
+      params: { guid: "download-guid-1", state: "completed", receivedBytes: 100, totalBytes: 100 },
+    });
+    assert.equal(viewer.messages.filter((message) => message.type === "download").length, 2);
+    assert.equal(viewer.messages.filter((message) => message.type === "download").at(-1).file.state, "ready");
+  } finally {
+    broker.removeViewer("office", viewer);
     broker.stop();
     rmSync(directory, { recursive: true, force: true });
   }
@@ -1400,7 +1652,7 @@ test("十二个独立窗口并行推流且慢客户端不累积帧", async () =>
   const connection = new ScreencastConnection("screencast");
   const broker = new WorkspaceBroker({
     store,
-    frameFps: 10,
+    activeFrameFps: 10,
     connect: async () => connection,
     logger: { warn() {}, error() {} },
   });
@@ -1437,16 +1689,14 @@ test("十二个独立窗口并行推流且慢客户端不累积帧", async () =>
   }
 });
 
-test("聚焦窗口使用 60 FPS 连续流且隐藏后停止", async () => {
+test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-active-screencast-"));
   const store = createStateStore({ file: join(directory, "state.json") });
   store.createWorkspace({ id: "active", name: "Active", startUrl: "https://chatgpt.com/" });
   const connection = new ScreencastConnection("active-screencast");
   const broker = new WorkspaceBroker({
     store,
-    frameFps: 8,
     activeFrameFps: 60,
-    idleFrameMs: 10000,
     connect: async () => connection,
     logger: { warn() {}, error() {} },
   });
@@ -1454,7 +1704,7 @@ test("聚焦窗口使用 60 FPS 连续流且隐藏后停止", async () => {
   try {
     await broker.addViewer("active", viewer);
     const initialStarts = connection.calls.filter((call) => call.method === "Page.startScreencast").length;
-    await broker.handleCommand("active", { type: "viewerState", visible: true, focused: true }, null, viewer);
+    await broker.handleCommand("active", { type: "viewerState", visible: true }, null, viewer);
     const activeStart = connection.calls.filter((call) => call.method === "Page.startScreencast").at(-1);
     assert.equal(connection.calls.filter((call) => call.method === "Page.startScreencast").length, initialStarts);
     assert.equal("everyNthFrame" in activeStart.params, false);
@@ -1463,31 +1713,19 @@ test("聚焦窗口使用 60 FPS 连续流且隐藏后停止", async () => {
     assert.equal(activeStart.params.quality, 72);
     connection.emitFrame(activeStart.sessionId);
     assert.equal(viewer.frames, 1);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 2200));
     connection.emitFrame(activeStart.sessionId, "compositor-only-change");
-    assert.equal(viewer.frames, 1);
-    assert.equal(broker.status().idleFrames, 1);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
-    connection.emit("event", {
-      method: "Runtime.bindingCalled",
-      sessionId: activeStart.sessionId,
-      params: { name: "__gpcVisualActivity" },
-    });
-    connection.emitFrame(activeStart.sessionId, "dom-change");
     assert.equal(viewer.frames, 2);
-    assert.equal(broker.status().focusedViewers, 1);
+    assert.equal("idleFrames" in broker.status(), false);
+    assert.equal("heartbeatFrames" in broker.status(), false);
     assert.equal(broker.status().visibleViewers, 1);
-    assert.equal(broker.status().activeWorkspaces, 1);
-    assert.equal(broker.status().frameFps, 8);
     assert.equal(broker.status().activeFrameFps, 60);
     assert.equal(broker.status().streamTier, "full");
-    await broker.handleCommand("active", { type: "viewerState", visible: false, focused: true }, null, viewer);
-    assert.equal(broker.status().focusedViewers, 0);
+    await broker.handleCommand("active", { type: "viewerState", visible: false }, null, viewer);
     assert.equal(broker.status().visibleViewers, 0);
-    assert.equal(broker.status().activeWorkspaces, 0);
     assert.equal(broker.status().capturing, 0);
     assert.equal(connection.calls.filter((call) => call.method === "Browser.setWindowBounds").at(-1).params.bounds.windowState, "minimized");
-    await broker.handleCommand("active", { type: "viewerState", visible: true, focused: false }, null, viewer);
+    await broker.handleCommand("active", { type: "viewerState", visible: true }, null, viewer);
     assert.equal(broker.status().visibleViewers, 1);
     const resumedStart = connection.calls.filter((call) => call.method === "Page.startScreencast").at(-1);
     assert.equal("everyNthFrame" in resumedStart.params, false);
@@ -1498,16 +1736,14 @@ test("聚焦窗口使用 60 FPS 连续流且隐藏后停止", async () => {
   }
 });
 
-test("后台帧预算按真实经过时间限速", async () => {
+test("可见工作区帧预算按真实经过时间限速", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-frame-budget-"));
   const store = createStateStore({ file: join(directory, "state.json") });
   store.createWorkspace({ id: "background", name: "Background", startUrl: "https://chatgpt.com/" });
   const connection = new ScreencastConnection("frame-budget");
   const broker = new WorkspaceBroker({
     store,
-    frameFps: 8,
-    activeFrameFps: 60,
-    idleFrameMs: 10000,
+    activeFrameFps: 8,
     connect: async () => connection,
     logger: { warn() {}, error() {} },
   });
@@ -1518,47 +1754,12 @@ test("后台帧预算按真实经过时间限速", async () => {
     connection.emitFrame(sessionId, "initial");
     for (let index = 0; index < 10; index += 1) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-      connection.emit("event", {
-        method: "Runtime.bindingCalled",
-        sessionId,
-        params: { name: "__gpcVisualActivity" },
-      });
       connection.emitFrame(sessionId, `frame-${index}`);
     }
     assert.ok(viewer.frames >= 8 && viewer.frames <= 10);
     assert.ok(broker.status().throttledFrames >= 1);
   } finally {
     broker.removeViewer("background", viewer);
-    broker.stop();
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test("静止工作区只复用最后画面保活", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-heartbeat-"));
-  const store = createStateStore({ file: join(directory, "state.json") });
-  store.createWorkspace({ id: "quiet", name: "Quiet", startUrl: "https://chatgpt.com/" });
-  const connection = new ScreencastConnection("quiet-screencast");
-  const broker = new WorkspaceBroker({
-    store,
-    frameFps: 60,
-    activeFrameFps: 60,
-    idleFrameMs: 500,
-    connect: async () => connection,
-    logger: { warn() {}, error() {} },
-  });
-  const viewer = new FakeViewer();
-  try {
-    broker.start();
-    await broker.addViewer("quiet", viewer);
-    const start = connection.calls.filter((call) => call.method === "Page.startScreencast").at(-1);
-    connection.emitFrame(start.sessionId, "initial");
-    await new Promise((resolveWait) => setTimeout(resolveWait, 1100));
-    assert.equal(broker.status().frames, 1);
-    assert.ok(broker.status().heartbeatFrames >= 1);
-    assert.ok(viewer.frames >= 2);
-  } finally {
-    broker.removeViewer("quiet", viewer);
     broker.stop();
     rmSync(directory, { recursive: true, force: true });
   }

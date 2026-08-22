@@ -1,6 +1,7 @@
 import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "./text-input.js";
 
 const app = globalThis.document?.querySelector("#app") || null;
+const IN_PAGE_NOTICE_MS = 5000;
 
 const icon = () => node("span", { class: "brand-mark", "aria-hidden": "true" }, "✦");
 
@@ -898,7 +899,7 @@ async function renderAdmin() {
       { class: "admin-system-actions" },
       node(
         "a",
-        { class: "button small", href: "/admin/maintenance/", target: "_blank", rel: "noopener" },
+        { class: "button small", href: "/admin/maintenance/", target: "_blank", rel: "noopener noreferrer" },
         "打开管理员浏览器",
       ),
       logout,
@@ -961,6 +962,57 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   );
   const canvas = node("canvas", { class: "screen", width: viewport.width, height: viewport.height, tabindex: "0" });
   const stage = node("div", { class: "screen-stage" }, canvas);
+  const notificationTitle = node("strong");
+  const notificationBody = node("span");
+  let noticeTimer = null;
+  const dismissNotice = () => {
+    clearTimeout(noticeTimer);
+    noticeTimer = null;
+    notificationNotice.hidden = true;
+    document.title = workspace.name;
+  };
+  const notificationNotice = node(
+    "button",
+    {
+      type: "button",
+      class: "viewer-notification",
+      hidden: true,
+      "aria-live": "assertive",
+      onClick: dismissNotice,
+    },
+    notificationTitle,
+    notificationBody,
+    node("span", { class: "viewer-notification-close" }, "关闭"),
+  );
+  const showInPageNotice = (title, body) => {
+    clearTimeout(noticeTimer);
+    notificationTitle.textContent = title;
+    notificationBody.textContent = body;
+    notificationNotice.hidden = false;
+    document.title = `● ${workspace.name}`;
+    noticeTimer = setTimeout(dismissNotice, IN_PAGE_NOTICE_MS);
+  };
+  const deliverNotice = (title, body) => {
+    const BrowserNotification = globalThis.Notification;
+    if (!BrowserNotification || BrowserNotification.permission !== "granted") {
+      showInPageNotice(title, body);
+      return;
+    }
+    try {
+      const systemNotice = new BrowserNotification(title, { body });
+      systemNotice.addEventListener(
+        "click",
+        () => {
+          globalThis.focus();
+          systemNotice.close();
+        },
+        { once: true },
+      );
+      systemNotice.addEventListener("error", () => showInPageNotice(title, body), { once: true });
+    } catch {
+      showInPageNotice(title, body);
+    }
+  };
   const keyCapture = node("textarea", {
     class: "key-capture",
     "aria-label": "键盘输入",
@@ -988,7 +1040,6 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     send({
       type: "viewerState",
       visible: document.visibilityState === "visible",
-      focused: document.visibilityState === "visible" && document.hasFocus(),
     });
   };
 
@@ -1001,6 +1052,22 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       menuToggle.title = text;
     }
     if (state === "error" && controlPanel && (!transferPanel || transferPanel.hidden)) setPanelOpen(true);
+  };
+  const requestBrowserNotifications = () => {
+    const BrowserNotification = globalThis.Notification;
+    if (
+      !globalThis.isSecureContext ||
+      !BrowserNotification ||
+      BrowserNotification.permission !== "default"
+    ) {
+      return;
+    }
+    BrowserNotification.requestPermission().then((permission) => {
+      setStatus(
+        permission === "granted" ? "浏览器通知已开启" : "浏览器未允许通知，将使用页面提醒",
+        permission === "granted" ? "online" : "",
+      );
+    });
   };
 
   const drawNewestFrame = async (blob) => {
@@ -1064,8 +1131,15 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
           if (pointerEditable === true) nativeInput.focus();
         } else if (payload.type === "download") {
           refreshTransfers().catch((error) => setStatus(error.message, "error"));
+          if (payload.file.state === "ready") {
+            deliverNotice("下载完成", `${payload.file.name} 已保存到私人文件区`);
+          } else if (payload.file.state === "failed") {
+            deliverNotice("下载失败", `${payload.file.name}：${payload.file.error}`);
+          }
         } else if (payload.type === "clipboard") {
           if (!nativeInput.copyClipboardText(payload.text)) setStatus("本机浏览器拒绝写入剪贴板", "error");
+        } else if (payload.type === "notification") {
+          deliverNotice(payload.title || "ChatGPT 通知", payload.body);
         } else if (payload.type === "selection") {
           nativeInput.setSelectionText(payload.text);
         } else if (payload.type === "input-target" && payload.sequence === pointerSequence) {
@@ -1100,8 +1174,6 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   };
 
   document.addEventListener("visibilitychange", sendViewerState);
-  window.addEventListener("focus", sendViewerState);
-  window.addEventListener("blur", sendViewerState);
 
   const position = (event) => {
     const rect = canvas.getBoundingClientRect();
@@ -1446,8 +1518,18 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       node("div", { class: "viewer-panel-identity" }, node("strong", {}, workspace.name)),
       status,
     ),
-    node("div", { class: "viewer-panel-actions" }, upload, uploadInput, downloads, fullscreen, reload, logout),
+    node(
+      "div",
+      { class: "viewer-panel-actions" },
+      upload,
+      uploadInput,
+      downloads,
+      fullscreen,
+      reload,
+      logout,
+    ),
   );
+  let suppressMenuClick = false;
   menuToggle = node(
     "button",
     {
@@ -1456,7 +1538,13 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       title: "打开工作区菜单",
       "aria-label": "打开工作区菜单",
       "aria-expanded": "false",
-      onClick: () => setPanelOpen(controlPanel.hidden),
+      onClick: () => {
+        if (suppressMenuClick) {
+          suppressMenuClick = false;
+          return;
+        }
+        setPanelOpen(controlPanel.hidden);
+      },
     },
     node("span", { class: "viewer-menu-icon", "aria-hidden": "true" }),
   );
@@ -1469,8 +1557,76 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     menuToggle.setAttribute("aria-label", open ? "收起工作区菜单" : "打开工作区菜单");
     if (!open && pointerEditable === true) nativeInput.focus();
   };
-  const viewer = node("div", { class: "viewer" }, stage, homeButton, menuToggle, controlPanel, transferPanel, keyCapture);
+  const toolbar = node(
+    "div",
+    { class: "viewer-toolbar" },
+    homeButton,
+    menuToggle,
+    controlPanel,
+    transferPanel,
+  );
+  const toolbarPositionKey = `gpc.viewerToolbarPosition.${workspace.id}`;
+  const restoreToolbarPosition = () => {
+    const [left, top] = String(localStorage.getItem(toolbarPositionKey) || "").split(",").map(Number);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+    const maxLeft = Math.max(8, window.innerWidth - toolbar.offsetWidth - 8);
+    const maxTop = Math.max(8, window.innerHeight - toolbar.offsetHeight - 8);
+    toolbar.style.right = "auto";
+    toolbar.style.left = `${Math.min(maxLeft, Math.max(8, left))}px`;
+    toolbar.style.top = `${Math.min(maxTop, Math.max(8, top))}px`;
+  };
+  let toolbarDrag = null;
+  menuToggle.addEventListener("pointerdown", (event) => {
+    const rect = toolbar.getBoundingClientRect();
+    toolbarDrag = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      left: rect.left,
+      top: rect.top,
+      moved: false,
+    };
+    menuToggle.setPointerCapture(event.pointerId);
+  });
+  menuToggle.addEventListener("pointermove", (event) => {
+    if (!toolbarDrag || event.pointerId !== toolbarDrag.pointerId) return;
+    const deltaX = event.clientX - toolbarDrag.x;
+    const deltaY = event.clientY - toolbarDrag.y;
+    if (!toolbarDrag.moved && Math.hypot(deltaX, deltaY) < 4) return;
+    if (!toolbarDrag.moved) {
+      toolbarDrag.moved = true;
+      toolbar.style.right = "auto";
+      toolbar.style.left = `${toolbarDrag.left}px`;
+      toolbar.style.top = `${toolbarDrag.top}px`;
+    }
+    event.preventDefault();
+    const maxLeft = Math.max(8, window.innerWidth - toolbar.offsetWidth - 8);
+    const maxTop = Math.max(8, window.innerHeight - toolbar.offsetHeight - 8);
+    toolbar.style.left = `${Math.min(maxLeft, Math.max(8, toolbarDrag.left + deltaX))}px`;
+    toolbar.style.top = `${Math.min(maxTop, Math.max(8, toolbarDrag.top + deltaY))}px`;
+  });
+  const finishToolbarDrag = (event, canceled = false) => {
+    if (!toolbarDrag || event.pointerId !== toolbarDrag.pointerId) return;
+    suppressMenuClick = !canceled && toolbarDrag.moved;
+    if (suppressMenuClick) {
+      localStorage.setItem(toolbarPositionKey, `${toolbar.offsetLeft},${toolbar.offsetTop}`);
+    }
+    menuToggle.releasePointerCapture(event.pointerId);
+    toolbarDrag = null;
+  };
+  menuToggle.addEventListener("pointerup", finishToolbarDrag);
+  menuToggle.addEventListener("pointercancel", (event) => finishToolbarDrag(event, true));
+  const viewer = node(
+    "div",
+    { class: "viewer" },
+    stage,
+    notificationNotice,
+    toolbar,
+    keyCapture,
+  );
+  viewer.addEventListener("click", requestBrowserNotifications, { once: true });
   replace(viewer);
+  restoreToolbarPosition();
 
   let resizeTimer;
   new ResizeObserver(() => {

@@ -127,7 +127,6 @@ test("同一客户端可用路径 Cookie 同时保持不同用户与 Target", as
     transfers,
     webDir: join(process.cwd(), "gateway/web"),
     maintenanceTarget: `http://127.0.0.1:${maintenanceAddress.port}`,
-    maintenancePublicUrl: "http://gateway.example.test:8443/",
     resolveBrowserProfile: async ({ force }) => {
       assert.equal(force, true);
       const profile = store.setBrowserProfile(
@@ -316,24 +315,40 @@ test("同一客户端可用路径 Cookie 同时保持不同用户与 Target", as
       redirect: "manual",
     });
     assert.equal(maintenanceRedirect.status, 302);
-    assert.equal(maintenanceRedirect.headers.get("location"), "http://gateway.example.test:8443/");
+    const handoffLocation = new URL(maintenanceRedirect.headers.get("location"));
+    assert.equal(handoffLocation.origin, "http://127.0.0.1:36091");
+    assert.match(handoffLocation.searchParams.get("handoff"), /^[0-9a-f]{48}$/);
+    assert.equal(maintenanceRedirect.headers.get("referrer-policy"), "no-referrer");
     const maintenanceGateway = gateway.maintenanceServer.address();
     const maintenanceBase = `http://127.0.0.1:${maintenanceGateway.port}`;
     assert.equal((await fetch(maintenanceBase)).status, 401);
     assert.equal((await fetch(`${maintenanceBase}/__gpc/admin-browser.js`)).status, 401);
-    const maintenanceScript = await fetch(`${maintenanceBase}/__gpc/admin-browser.js`, { headers: { cookie: adminCookie } });
+    const handoffResponse = await fetch(`${maintenanceBase}/?handoff=${handoffLocation.searchParams.get("handoff")}`, {
+      redirect: "manual",
+    });
+    assert.equal(handoffResponse.status, 200);
+    assert.equal(handoffResponse.headers.get("referrer-policy"), "no-referrer");
+    assert.match(handoffResponse.headers.get("content-security-policy"), /default-src 'none'/);
+    const maintenanceCookie = cookieOf(handoffResponse);
+    assert.equal(maintenanceCookie, adminCookie);
+    assert.match(await handoffResponse.text(), /http-equiv="refresh" content="0;url=\/vnc\/"/);
+    assert.equal(
+      (await fetch(`${maintenanceBase}/?handoff=${handoffLocation.searchParams.get("handoff")}`)).status,
+      401,
+    );
+    const maintenanceScript = await fetch(`${maintenanceBase}/__gpc/admin-browser.js`, { headers: { cookie: maintenanceCookie } });
     assert.equal(maintenanceScript.status, 200);
     assert.match(await maintenanceScript.text(), /noVNC_setting_enable_ime/);
     const maintenanceRoot = await fetch(maintenanceBase, {
-      headers: { cookie: adminCookie },
+      headers: { cookie: maintenanceCookie },
       redirect: "manual",
     });
     assert.equal(maintenanceRoot.status, 302);
     assert.equal(maintenanceRoot.headers.get("location"), "/vnc/");
-    const maintenanceAuthenticated = await fetch(`${maintenanceBase}/vnc/`, { headers: { cookie: adminCookie } });
+    const maintenanceAuthenticated = await fetch(`${maintenanceBase}/vnc/`, { headers: { cookie: maintenanceCookie } });
     assert.equal(maintenanceAuthenticated.status, 200);
     assert.equal(await maintenanceAuthenticated.text(), "maintenance-ok");
-    assert.equal(broker.maintenanceFocuses, 1);
+    assert.equal(broker.maintenanceFocuses, 2);
     const created = await jsonRequest(base, "/admin/api/workspaces", {
       method: "POST",
       cookie: adminCookie,

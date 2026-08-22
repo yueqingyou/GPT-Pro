@@ -37,13 +37,14 @@ administrator ─▶ /admin/maintenance/ ─▶ full KasmVNC Chromium browser
 - A workspace Target is tagged inside its top-level window. A gateway restart reclaims existing windows; a Chromium restart recreates them from each saved last URL.
 - A client window at `/w/<workspace-id>/` receives a path-scoped HttpOnly cookie. Different workspace paths can therefore remain logged in as different gateway users in the same local browser profile.
 - Mouse, keyboard and text insertion are sent with that workspace's CDP `sessionId`; clients never receive a raw Target ID or DevTools credential.
-- Each visible workspace starts an independent CDP screencast and Chromium pushes JPEG frames without a per-frame screenshot request or cross-workspace serial queue. A lightweight signal in a named CDP isolated world watches only DOM node/text, scroll, input and resize activity so compositor-only frames are suppressed while the page is otherwise static. Source frames are acknowledged immediately; the gateway uses elapsed-time budgets for the foreground and visible-background delivery ceilings. With no visible viewer, the stream stops and the remote window is minimized. Slow clients drop stale frames and static views reuse the last frame for heartbeats, so buffers stay bounded.
+- Each visible workspace starts an independent CDP screencast and Chromium pushes JPEG frames without a per-frame screenshot request or cross-workspace serial queue. Source frames are acknowledged immediately, and the gateway uses an elapsed-time delivery budget while continuously delivering every source frame Chromium produces. Hiding the page stops the stream and minimizes its remote window; making it visible resumes immediately. Slow clients drop stale frames, so buffers stay bounded.
 - Ordinary workspace Targets receive an administrator-configurable sensitive-operation guard. Matching controls are hidden, then clicks and keyboard activation are checked again by the gateway before it sends a CDP `Input` event. Explicit URL blacklist entries are blocked by Chromium. The page has no capture-phase event blocker, and ordinary document requests are not paused, continued or rewritten through CDP `Fetch`. DOM changes rescan only added regions. Account, subscription, security, global settings and ChatGPT sign-out belong in the administrator browser.
-- An ordinary entry shows only the project canvas, a persistent project-home button and a collapsed control panel. The managed page hides the web sidebar, top-left project name/icon link, project menus, sharing, Chat/Work switch, dictation and voice controls. Project sharing, conversation sharing and per-message sharing are also rejected before input is sent. Its administrator-managed `@` / `+` tool allowlist matches exact function names, never positions or counts; the default names are `Add photos & files`, `Create image`, `Web search` and `Deep research`. **Add sources** in Sources is fixed to `Upload` and `Text input`. Popups opened by an ordinary page are closed immediately, and top-level navigation cannot leave `chatgpt.com`. If the configured start address is a recognized ChatGPT project URL, its project home can open or create a conversation even when ChatGPT gives that conversation route a different `g-p` identifier. Once inside a conversation, navigation stays on that conversation or returns to the configured project home from the persistent local button. This modifies DOM/CSS and is UI/access hardening, not an undetectability or risk-evasion guarantee.
-- The administrator entry uses the KasmVNC core page directly without its audio/file wrapper. While its Kasm connection is open, the unmanaged administrator Chromium window is kept in front. Use it for ChatGPT login/sign-out, MFA, global Profile management and Chrome extension installation; it is not the normal multi-workspace transport.
-- A local upload is saved only to the current user's private directory and is never attached to ChatGPT automatically. After clicking upload in ChatGPT, the user manually selects and confirms a private file. Chromium downloads also stay in the dedicated transfer directory, and the gateway never mounts the Chromium Profile.
+- An ordinary entry shows only the project canvas, a project-home/menu toolbar that starts lower and moves as one group by dragging the menu icon itself, and a collapsed control panel that follows it. There is no separate drag handle; the current browser remembers the last position for each workspace and restores it within the visible viewport. The managed page hides the web sidebar, top-left project name/icon link, project menus, sharing, Chat/Work switch, dictation and voice controls. Project sharing, conversation sharing and per-message sharing are also rejected before input is sent. Its administrator-managed `@` / `+` tool allowlist matches exact function names, never positions or counts; the default names are `Add photos & files`, `Create image`, `Web search` and `Deep research`. **Add sources** in Sources is fixed to `Upload` and `Text input`. Popups opened by an ordinary page are closed immediately, and top-level navigation cannot leave `chatgpt.com`. If the configured start address is a recognized ChatGPT project URL, its project home can open or create a conversation even when ChatGPT gives that conversation route a different `g-p` identifier. Once inside a conversation, navigation stays on that conversation or returns to the configured project home from the persistent local button. This modifies DOM/CSS and is UI/access hardening, not an undetectability or risk-evasion guarantee.
+- The administrator entry uses the KasmVNC core page directly without its audio/file wrapper. The management-page button transfers the current administrator login to the loopback-only entry with a random, single-use handoff that expires after 30 seconds; the long-lived session token is never placed in the URL and no second login is required. While its Kasm connection is open, the unmanaged administrator Chromium window is kept in front. Use it for ChatGPT login/sign-out, MFA, global Profile management and Chrome extension installation; it is not the normal multi-workspace transport.
+- A local upload is saved only to the current user's private directory and is never attached to ChatGPT automatically. After clicking upload in ChatGPT, the user manually selects and confirms a private file. Explicit ChatGPT downloads are converted into Chromium downloads for the current workspace and stay in the dedicated transfer directory. Completion or failure sends a system notification when the ordinary browser has permission; otherwise a right-top in-page notice with the file name closes after five seconds. Ordinary navigation remains restricted and the gateway never mounts the Chromium Profile.
 - Timezone, the JavaScript default locale, `navigator.languages` and HTTP `Accept-Language` are global properties of the one profile and stay identical across every Target and the administrator browser.
 - An ordinary workspace submits the final text produced by the access device's own browser and operating-system input method—English, Chinese, Japanese, Korean, emoji, paste or other Unicode—to its Target. Candidates and unfinished composition remain local. A remote plain-text selection is mirrored only into that viewer's hidden local input, so native `Cmd/Ctrl+C` and `Cmd/Ctrl+X` copy or cut into the access device's clipboard. ChatGPT's message-copy buttons stay visible and transfer the resulting remote system-clipboard text to the viewer that clicked. The administrator desktop enables KasmVNC's native IME Input Mode instead of layering a project-specific input method on top.
+- After the administrator enables `chatgpt.com` notifications in the full browser, native web notifications actually produced by a managed page relay their title and body to that workspace in real time. The ordinary browser sends a system notification when that local origin has permission; otherwise it displays a right-top in-page notice for five seconds and temporarily marks its tab title. An internal-only HTTPS entry with a publicly trusted certificate requires no certificate, policy or extension installation on ordinary clients and opens the browser's native permission prompt on the first page click; an unmanaged HTTP page can only use the in-page fallback.
 
 ## Install locally
 
@@ -53,10 +54,11 @@ Requirements: Docker with Compose v2. Docker Desktop works on macOS and Windows;
 git clone https://github.com/yueqingyou/GPT-Pro-Cloud.git
 cd GPT-Pro-Cloud
 cp .env.example .env
+# Fill in the dedicated DNSPod CAM user's SecretId and SecretKey in .env
 ./scripts/up.sh
 ```
 
-Open `http://127.0.0.1:36090/admin/`.
+On the deployment host, open `http://127.0.0.1:36090/admin/`. Ordinary users only visit `https://pro.lyhbio.cn/w/<id>/`.
 
 1. Create the administrator, unless `AUTH_PASSWORD` pre-created it.
 2. Review **Browser environment**. On first start it detects timezone and language through Chromium's actual egress; the administrator can replace an unsuitable result.
@@ -64,8 +66,8 @@ Open `http://127.0.0.1:36090/admin/`.
 4. Add any remaining local users and assign their workspaces. User and workspace counts are not fixed.
 5. Review **`@` / `+` tool allowlist**. It stores one exact displayed function name per line; an empty list denies every composer-menu tool.
 6. Review **Sensitive-operation blacklist**. Its defaults reserve the account menu, settings, sign-out, subscription, security and destructive global operations for the administrator.
-7. After signing in to `/admin/`, select **Open administrator browser** in the system panel and sign in to the single ChatGPT account once. Complete MFA and manage Chrome extensions there.
-8. Open or refresh each workspace. Save each `/w/<id>/` URL as a location-specific bookmark.
+7. After signing in to `/admin/`, select **Open administrator browser** in the system panel and sign in to the single ChatGPT account once. Complete MFA, grant ChatGPT notification permission, and manage Chrome extensions there.
+8. Open or refresh each workspace. Save each `/w/<id>/` URL as a location-specific bookmark; completion notices appear directly in every connected ordinary page.
 
 `./data/browser/` stores the one Chromium profile and ChatGPT login. `./data-panel/state.json`, `sessions.json` and `transfers.json` store gateway state. `./data-transfer/` stores per-user private uploads and Chromium downloads. All three data roots are ignored by Git.
 
@@ -88,9 +90,10 @@ The commented [`.env.example`](.env.example) is authoritative.
 | Variable | Purpose |
 | --- | --- |
 | `AUTH_USER` / `AUTH_PASSWORD` | Optionally pre-create the administrator. Leave the password empty for the first-visit setup page |
-| `BIND_ADDR` / `HTTP_PORT` | Published gateway address and port |
-| `MAINTENANCE_BIND_ADDR` / `MAINTENANCE_PORT` | Administrator-only full Chromium browser listener; defaults to loopback `:36091` |
-| `MAINTENANCE_PUBLIC_URL` | Optional complete URL for the administrator browser's separate HTTPS port; it must use the same hostname as the normal entry so the host-only administrator cookie remains available |
+| `PUBLIC_HOST` | Ordinary-user HTTPS host; this deployment uses `pro.lyhbio.cn` |
+| `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` | Dedicated CAM user credentials restricted to reading, creating and deleting DNSPod challenge records |
+| `BIND_ADDR` / `HTTP_PORT` | Local gateway administration and health-check entry; loopback by default |
+| `MAINTENANCE_PORT` | Administrator-only full Chromium browser port; its listener and management-page redirect are fixed to `127.0.0.1` |
 | `PUID` / `PGID` / `TZ` | Desktop file ownership and bootstrap timezone; `TZ` is also the deployment value used after a detection failure |
 | `START_URL` | Initial page shown in the administrator browser |
 | `PROXY_URL` | One global Chromium proxy; loopback hostnames are rewritten for Docker |
@@ -99,9 +102,7 @@ The commented [`.env.example`](.env.example) is authoritative.
 | `PROFILE_TIMEZONE` / `PROFILE_LOCALE` | Optional deployment values used when automatic detection fails or is disabled |
 | `VNC_PASSWORD` | Internal administrator-browser credential; VNC is not published to the host |
 | `MAX_FILE_BYTES` / `TRANSFER_QUOTA_BYTES` | Per-file and total transfer-directory limits in bytes; defaults to 512 MiB / 4 GiB |
-| `FRAME_FPS` | Sampling and delivery ceiling for a visible but unfocused workspace; default `8` |
-| `FRAME_ACTIVE_FPS` | Sampling and delivery ceiling for a focused or recently interactive workspace; default `60` |
-| `FRAME_IDLE_MS` | Interval for reusing the last static frame as a heartbeat; default `2000` ms |
+| `FRAME_ACTIVE_FPS` | Sampling and delivery ceiling for a visible workspace; default `60` |
 | `JPEG_QUALITY` | Screen-stream JPEG quality, `35–90`; default `72` |
 
 Because all Targets share one Chromium process and network stack, per-workspace proxies are intentionally unsupported.
@@ -124,6 +125,7 @@ Normal workspace windows support:
 - Unicode text and native paste produced by the access device's own input method;
 - native copy and cut of the current remote plain-text selection into the access device's clipboard;
 - ChatGPT message-copy buttons that copy the remote system clipboard into the triggering access window;
+- ChatGPT page notification titles and bodies relayed as ordinary in-page notices;
 - local staging into the user's private directory, followed by explicit selection after ChatGPT opens a file chooser;
 - a workspace-scoped file panel for downloading completed remote Chromium files back to the local device;
 - return to the project home, refresh and browser fullscreen;
@@ -134,7 +136,8 @@ Current limitations:
 - rich-text, image and file clipboard formats are not mirrored; selections and ChatGPT message-copy buttons transfer plain text only;
 - audio, microphone and ChatGPT voice mode are not streamed;
 - multiple simultaneous viewers of the same workspace share one viewport;
-- continuous Chromium streams still consume shared rendering, JPEG encoding, CPU, RAM and bandwidth; focused or recently interactive viewers use `FRAME_ACTIVE_FPS`, visible background viewers use `FRAME_FPS`, and streams stop when there is no visible viewer;
+- continuous Chromium streams still consume shared rendering, JPEG encoding, CPU, RAM and bandwidth; visible viewers use `FRAME_ACTIVE_FPS`, and hiding a page stops its stream;
+- notifications relay only while the ordinary page remains open and connected; closed pages and offline devices receive no backlog;
 - configured FPS is a sampling and delivery ceiling rather than a delivered-rate guarantee; shared Chromium rendering and encoding remain the limit when many pages change together;
 - administrator-installed extensions run in the shared Profile and can affect every workspace. Their permissions, fingerprint behavior and updates are outside this project's security guarantee.
 
@@ -146,7 +149,7 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 
 ## Security boundary
 
-- Only the gateway process publishes host ports. The normal entry is `:36090`; a second gateway listener exposes KasmVNC at its required root path and defaults to loopback `:36091`. The desktop container itself, Chromium DevTools and raw KasmVNC ports remain private.
+- Caddy publishes the ordinary HTTPS entry on `:443` to the LAN. Gateway `:36090` and administrator-browser `:36091` bind to loopback by default. Opening the administrator browser consumes a 30-second one-time handoff and reuses the authenticated administrator session on `127.0.0.1`; DNS, Caddy and a parent-domain Cookie are deliberately not used to widen this local boundary. The desktop container itself, Chromium DevTools and raw KasmVNC ports remain private.
 - The gateway no longer mounts `/var/run/docker.sock`.
 - Passwords use per-user salted scrypt hashes. Session and state files are created with private permissions.
 - Login attempts are rate-limited. Changing a password, disabling a user or changing workspace assignments revokes that user's sessions and sockets.
@@ -156,14 +159,14 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 - Private uploads are visible only to their owner. Staging a local file never touches a page file input; the gateway handles only the chooser that the user manually opens in ChatGPT and explicitly confirms. Downloads are visible only to the owning workspace or the administrator. File names, per-file size and total capacity are constrained.
 - Mutating HTTP requests and WebSocket upgrades reject cross-origin browser requests.
 - Corrupt state, session or transfer-index JSON causes startup to fail closed instead of silently resetting access control.
-- Direct HTTP is suitable only for a trusted LAN or VPN. Use HTTPS through a reverse proxy or tunnel for any public route, and bind `BIND_ADDR=127.0.0.1` behind that tunnel.
+- Ordinary users must not bypass `https://pro.lyhbio.cn` to reach the cleartext gateway. Public DNS publishes only the deployment host's private address for `pro.lyhbio.cn`; no public inbound port is opened.
 - Finish administrator setup on a trusted network before exposing the gateway. While no administrator exists, the first visitor can claim setup.
 
 ## Resource behavior
 
 There is no application-level two-workspace limit and no arbitrary fixed maximum. Every workspace has its own top-level window and `Page.startScreencast` stream. The gateway retains one last image per workspace; WebSocket backpressure and client-side newest-frame coalescing keep slow links bounded. Stream profiles adapt to the number of visible workspaces: one uses up to `2560×1600`, two to four use `1280×800`, five to eight use `960×600`, and nine or more use `800×500`; JPEG quality caps are 90, 70, 66 and 60 respectively, further limited by `JPEG_QUALITY`.
 
-The maintained regression baseline is twelve local users, each assigned one workspace, with `FRAME_FPS=8`, `FRAME_ACTIVE_FPS=60`, `FRAME_IDLE_MS=2000` and `JPEG_QUALITY=72`. On the reference Docker host, one dynamic ordinary window delivered 38.30 FPS at 0.87 MiB/s. Six active plus six visible-background windows delivered 10.33–11.07 FPS and 7.47–7.73 FPS respectively at 0.83 MiB/s total. Twelve active windows delivered 9.20–11.60 FPS each at 0.95 MiB/s total, with zero gateway backpressure drops; the desktop used about 172–192% CPU and 1.17–1.26 GiB, while the gateway settled near 11–14% CPU and 63–71 MiB after its connection-startup spike. A static window sent four heartbeat frames in seven seconds while eleven compositor frames were suppressed. `FRAME_ACTIVE_FPS=60` remains a ceiling: one headful Chromium process cannot make twelve OS-background windows render like twelve separate foreground browser processes. These synthetic results do not promise the capacity of twelve real signed-in ChatGPT conversations.
+The maintained regression baseline is twelve local users, each assigned one workspace, with `FRAME_ACTIVE_FPS=60` and `JPEG_QUALITY=72`. On the reference Docker host, one dynamic ordinary window delivered 38.30 FPS at 0.87 MiB/s. Twelve visible dynamic windows delivered 9.20–11.60 FPS each at 0.95 MiB/s total, with zero gateway backpressure drops; the desktop used about 172–192% CPU and 1.17–1.26 GiB, while the gateway settled near 11–14% CPU and 63–71 MiB after its connection-startup spike. `FRAME_ACTIVE_FPS=60` remains a ceiling: one headful Chromium process cannot make twelve OS-background windows render like twelve separate foreground browser processes. These synthetic results do not promise the capacity of twelve real signed-in ChatGPT conversations.
 
 ## Verification and development
 
@@ -176,7 +179,7 @@ docker compose up -d --build --wait
 curl -fsS http://127.0.0.1:36090/healthz
 ```
 
-The automated suite covers twelve-user dynamic configuration, Project preview and atomic batch import, permission isolation, path-scoped sessions, native text/IME, per-viewer selections and concurrent native copy ownership, the exact-name composer-tool allowlist, sensitive-operation guards, pre-input sharing and project-link rejection, project-home return, twelve independent window screencasts and slow-viewer backpressure, CDP Target/session routing, upload/download authorization, Target reclamation after a gateway restart, global timezone/language application, egress-detection failure handling, CSRF/Origin rejection and Compose structure. Runtime acceptance additionally requires a real Docker/Chromium host. A real ChatGPT Pro end-to-end acceptance still requires the operator to perform the one authorized ChatGPT login; no credentials are bundled or automated.
+The automated suite covers twelve-user dynamic configuration, Project preview and atomic batch import, permission isolation, path-scoped sessions, native text/IME, per-viewer selections and concurrent native copy ownership, workspace-scoped native web-notification relay and ordinary HTTP in-page presentation, the exact-name composer-tool allowlist, sensitive-operation guards, pre-input sharing and project-link rejection, project-home return, twelve independent window screencasts and slow-viewer backpressure, CDP Target/session routing, upload/download authorization, Target reclamation after a gateway restart, global timezone/language application, egress-detection failure handling, CSRF/Origin rejection and Compose structure. Runtime acceptance additionally requires a real Docker/Chromium host. A real ChatGPT Pro end-to-end acceptance still requires the operator to perform the one authorized ChatGPT login; no credentials are bundled or automated.
 
 See [Deploy.md](Deploy.md) for deployment, data, health and recovery details.
 

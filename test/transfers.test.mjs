@@ -122,7 +122,11 @@ test("下载完成后按实际落盘大小执行容量限制", () => {
     });
     assert.equal(completed.cancel, true);
     assert.equal(completed.entry.state, "failed");
+    assert.equal(completed.entry.error, "下载超过文件或目录容量限制");
     assert.throws(() => readFileSync(reported), /ENOENT/);
+    const canceled = store.updateDownload({ id, state: "canceled" });
+    assert.equal(canceled.terminal, false);
+    assert.equal(canceled.entry.error, "下载超过文件或目录容量限制");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
