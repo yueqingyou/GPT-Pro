@@ -20,6 +20,20 @@ function node(tag, attributes = {}, ...children) {
   return element;
 }
 
+function toolbarIcon(paths) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "viewer-toolbar-icon");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  for (const d of paths) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    svg.append(path);
+  }
+  return svg;
+}
+
 function replace(...children) {
   app.replaceChildren(...children);
 }
@@ -1478,19 +1492,36 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
 
   const startParts = new URL(workspace.startUrl).pathname.split("/").filter(Boolean);
   const homeButton = startParts.length === 3 && startParts[0] === "g" && startParts[2] === "project"
-    ? button("项目首页", {
-        class: "viewer-home-button",
-        onClick: () => {
-          if (!send({ type: "projectHome" })) {
-            setStatus("工作区连接尚未恢复", "error");
-            return;
-          }
-          if (!transferPanel.hidden) closeTransferPanel();
-          setPanelOpen(false);
+    ? node(
+        "button",
+        {
+          type: "button",
+          class: "viewer-toolbar-button viewer-home-button",
+          title: "项目首页",
+          "aria-label": "项目首页",
+          onClick: () => {
+            if (!send({ type: "projectHome" })) {
+              setStatus("工作区连接尚未恢复", "error");
+              return;
+            }
+            if (!transferPanel.hidden) closeTransferPanel();
+            setPanelOpen(false);
+          },
         },
-      })
+        toolbarIcon(["M3 11.5 12 4l9 7.5", "M5 10v10h14V10", "M9 20v-6h6v6"]),
+      )
     : null;
-  const reload = button("刷新页面", { class: "button small ghost", onClick: () => send({ type: "reload" }) });
+  const reloadButton = node(
+    "button",
+    {
+      type: "button",
+      class: "viewer-toolbar-button viewer-reload-button",
+      title: "刷新页面",
+      "aria-label": "刷新页面",
+      onClick: () => send({ type: "reload" }),
+    },
+    toolbarIcon(["M21 12a9 9 0 0 0-15-6.7L3 8", "M3 3v5h5", "M3 12a9 9 0 0 0 15 6.7l3-2.7", "M16 16h5v5"]),
+  );
   const fullscreen = button("进入全屏", {
     class: "button small ghost",
     onClick: () => app.requestFullscreen().catch((error) => setStatus(error.message, "error")),
@@ -1525,7 +1556,6 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       uploadInput,
       downloads,
       fullscreen,
-      reload,
       logout,
     ),
   );
@@ -1561,6 +1591,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     "div",
     { class: "viewer-toolbar" },
     homeButton,
+    reloadButton,
     menuToggle,
     controlPanel,
     transferPanel,

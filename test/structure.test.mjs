@@ -168,24 +168,35 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.doesNotMatch(client, /viewer-toolbar-drag|viewer-toolbar-grip|dragHandle/);
   assert.match(client, /viewer-status-icon/);
   assert.match(client, /viewer-menu-icon/);
-  assert.match(client, /button\("项目首页"/);
+  assert.match(client, /class: "viewer-toolbar-button viewer-home-button"/);
+  assert.match(client, /class: "viewer-toolbar-button viewer-reload-button"/);
+  assert.match(client, /"aria-label": "项目首页"/);
+  assert.match(client, /"aria-label": "刷新页面"/);
+  assert.match(client, /toolbarIcon\(\["M3 11\.5 12 4l9 7\.5"/);
+  assert.match(client, /toolbarIcon\(\["M21 12a9 9 0 0 0-15-6\.7L3 8"/);
+  assert.doesNotMatch(client, /button\("项目首页"|button\("刷新页面"/);
   assert.match(client, /type: "projectHome"/);
   assert.match(client, /button\("查看文件"/);
   assert.match(client, /button\("进入全屏"/);
   assert.match(client, /button\("退出登录"/);
   assert.match(
     client,
-    /upload,\n\s+uploadInput,\n\s+downloads,\n\s+fullscreen,\n\s+reload,\n\s+logout/,
+    /upload,\n\s+uploadInput,\n\s+downloads,\n\s+fullscreen,\n\s+logout/,
   );
+  assert.match(client, /homeButton,\n\s+reloadButton,\n\s+menuToggle/);
   assert.match(client, /stage,\n\s+notificationNotice,\n\s+toolbar,\n\s+keyCapture/);
   assert.doesNotMatch(client, /button\("文件"|button\("全屏"|button\("退出本地工作区"/);
-  assert.match(styles, /\.viewer-home-button/);
+  assert.match(styles, /\.viewer-toolbar-button/);
+  assert.match(styles, /\.viewer-toolbar-icon/);
   assert.match(styles, /\.viewer-notification/);
   assert.match(styles, /\.viewer-notification \{[^}]*top: 14px;[^}]*right: 14px;/s);
   assert.match(styles, /\.viewer-notification > span:not\(\.viewer-notification-close\)[^{]*\{[^}]*overflow-wrap: anywhere;/s);
   assert.match(styles, /\.viewer-toolbar \{\n\s+position: fixed;\n\s+z-index: 40;\n\s+top: 72px/);
   assert.doesNotMatch(styles, /viewer-toolbar-drag|viewer-toolbar-grip/);
   assert.match(styles, /\.viewer-control-panel \{\n\s+position: absolute;/);
+  assert.match(styles, /\.viewer-control-panel \{[^}]*width: min\(300px, calc\(100vw - 28px\)\);[^}]*padding: 10px;/s);
+  assert.match(styles, /\.viewer-panel-actions \{[^}]*gap: 6px;/s);
+  assert.match(styles, /\.viewer-panel-actions \.button \{[^}]*min-height: 32px;/s);
   assert.match(styles, /\.viewer-transfer-panel \{\n\s+position: absolute;/);
   assert.doesNotMatch(styles, /object-fit:\s*contain/);
   assert.match(cdp, /MIN_VIEWPORT_WIDTH = 320/);
