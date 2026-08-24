@@ -15,6 +15,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WEB = join(HERE, "web");
 const ADMIN_COOKIE = "gpc_admin_session";
 const WORKSPACE_COOKIE = "gpc_workspace_session";
+const VIEWER_REPLACED_CLOSE_CODE = 4000;
+const VIEWER_REPLACED_CLOSE_REASON = "replaced";
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_HANDOFF_TTL_MS = 30 * 1000;
 const BODY_LIMIT = 64 * 1024;
@@ -358,6 +360,7 @@ export function createGateway({
           ? { maxFileBytes: transfers.maxFileBytes, quotaBytes: transfers.quotaBytes }
           : null,
         browser: broker.status(),
+        workspaceViewers: broker.viewerCountsByWorkspace(),
       });
     }
 
@@ -803,7 +806,8 @@ export function createGateway({
 
   webSockets.on("connection", (socket, _request, context) => {
     const { workspaceId, user } = context;
-    liveSockets.add(user.id, socket);
+    const previousSocket = liveSockets.add(user.id, socket);
+    if (previousSocket) previousSocket.close(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON);
     let queue = Promise.resolve();
     let queuedCommands = 0;
     socket.on("message", (data, isBinary) => {

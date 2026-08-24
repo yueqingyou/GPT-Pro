@@ -39,6 +39,11 @@ class FakeBroker {
   status() {
     return { connected: true, workspaces: 2, targets: 2, viewers: this.viewers.length };
   }
+  viewerCountsByWorkspace() {
+    const counts = {};
+    for (const viewer of this.viewers) counts[viewer.workspaceId] = (counts[viewer.workspaceId] || 0) + 1;
+    return counts;
+  }
   start() {
     this.started = true;
   }
@@ -101,12 +106,12 @@ async function jsonRequest(base, path, { method = "GET", cookie, body, headers =
   return { response, body: await response.json() };
 }
 
-test("同一客户端可用路径 Cookie 同时保持不同用户与 Target", async () => {
+test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-api-"));
   const store = createStateStore({ file: join(directory, "state.json"), adminUser: "owner", adminPassword: "owner-password" });
   store.createWorkspace({ id: "office", name: "办公室", startUrl: "https://chatgpt.com/g/office" });
   store.createWorkspace({ id: "laboratory", name: "实验室", startUrl: "https://chatgpt.com/g/laboratory" });
-  store.createUser({ username: "office-user", password: "office-password", workspaceIds: ["office"] });
+  store.createUser({ username: "office-user", password: "office-password", workspaceIds: ["office", "laboratory"] });
   store.createUser({ username: "lab-user", password: "laboratory-password", workspaceIds: ["laboratory"] });
   store.setBrowserProfile(manualBrowserProfile({ timezone: "Asia/Shanghai", locale: "zh-CN" }));
   const sessions = createSessionStore({ file: join(directory, "sessions.json") });
@@ -189,7 +194,39 @@ test("同一客户端可用路径 Cookie 同时保持不同用户与 Target", as
     await new Promise((resolveWait) => setTimeout(resolveWait, 30));
     assert.deepEqual(broker.commands[0], { workspaceId: "office", command: { type: "text", text: "OFFICE_ONLY" } });
     assert.equal(broker.actors[0].username, "office-user");
-    ws.close();
+
+    const laboratoryLogin = await jsonRequest(base, "/w/laboratory/login", {
+      method: "POST",
+      body: { username: "office-user", password: "office-password" },
+    });
+    const laboratoryCookie = cookieOf(laboratoryLogin.response);
+    const officeReplaced = new Promise((resolveClose) => {
+      ws.once("close", (code, reason) => resolveClose({ code, reason: reason.toString() }));
+    });
+    const laboratorySocket = new WebSocket(`ws://127.0.0.1:${address.port}/w/laboratory/socket`, {
+      headers: { cookie: laboratoryCookie },
+    });
+    await new Promise((resolveOpen, reject) => {
+      laboratorySocket.once("open", resolveOpen);
+      laboratorySocket.once("error", reject);
+    });
+    assert.deepEqual(await officeReplaced, { code: 4000, reason: "replaced" });
+
+    const laboratoryReplaced = new Promise((resolveClose) => {
+      laboratorySocket.once("close", (code, reason) => resolveClose({ code, reason: reason.toString() }));
+    });
+    const activeSocket = new WebSocket(`ws://127.0.0.1:${address.port}/w/office/socket`, {
+      headers: { cookie: officeCookie },
+    });
+    await new Promise((resolveOpen, reject) => {
+      activeSocket.once("open", resolveOpen);
+      activeSocket.once("error", reject);
+    });
+    assert.deepEqual(await laboratoryReplaced, { code: 4000, reason: "replaced" });
+    activeSocket.send(JSON.stringify({ type: "text", text: "LATEST_ONLY" }));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+    assert.deepEqual(broker.commands[1], { workspaceId: "office", command: { type: "text", text: "LATEST_ONLY" } });
+    assert.equal(broker.actors[1].username, "office-user");
 
     const adminLogin = await jsonRequest(base, "/admin/login", {
       method: "POST",
@@ -257,6 +294,11 @@ test("同一客户端可用路径 Cookie 同时保持不同用户与 Target", as
       "Web search",
       "Deep research",
     ]);
+    assert.deepEqual(stateResponse.body.workspaceViewers, { office: 1 });
+    const publicHealth = await jsonRequest(base, "/healthz");
+    assert.equal(Object.hasOwn(publicHealth.body, "workspaceViewers"), false);
+    assert.equal(Object.hasOwn(publicHealth.body.browser, "workspaceViewers"), false);
+    activeSocket.close();
     const composerTools = await jsonRequest(base, "/admin/api/composer-tools", {
       method: "PATCH",
       cookie: adminCookie,

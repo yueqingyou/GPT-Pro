@@ -96,12 +96,14 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(cdp, /new Proxy\(NativeNotification/);
   assert.match(cdp, /type: "notification"/);
   assert.match(cdp, /captureMode: "target-screencast"/);
+  assert.match(cdp, /viewerCountsByWorkspace\(\)/);
   assert.match(cdp, /newWindow: true/);
   assert.doesNotMatch(cdp, /Page\.captureScreenshot/);
   assert.match(cdp, /activeFrameFps/);
   assert.doesNotMatch(cdp, /gpc-visual-activity|visualActiveUntil|idleFrames|heartbeatFrames/);
-  assert.match(cdp, /SCREENCAST_TIERS/);
-  assert.match(cdp, /streamTier/);
+  assert.match(cdp, /SCREENCAST_MAX_WIDTH = 2560/);
+  assert.match(cdp, /SCREENCAST_MAX_HEIGHT = 1600/);
+  assert.doesNotMatch(cdp, /SCREENCAST_TIERS|streamTier|visibleWorkspaceCount/);
   assert.doesNotMatch(cdp, /Target\.activateTarget/);
   assert.match(cdp, /userAgentMetadata/);
   const focus = read("lib/focus.mjs");
@@ -147,6 +149,10 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /document\.title = `● \$\{workspace\.name\}`/);
   assert.doesNotMatch(server, /notifications\.js/);
   assert.match(client, /payload\.type === "input-target"/);
+  assert.match(client, /VIEWER_REPLACED_CLOSE_CODE = 4000/);
+  assert.match(client, /当前窗口已停止/);
+  assert.match(client, /event\.code === VIEWER_REPLACED_CLOSE_CODE/);
+  assert.match(server, /previousSocket\.close\(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON\)/);
   assert.match(client, /copyClipboardText/);
   assert.match(client, /button: pressedPointerButton\(event\.buttons\)/);
   assert.match(client, /sendPendingPointerMove\(\);\n\s+sendPointer\(event, "mouseReleased"\);\n\s+send\(\{ type: "selection" \}\)/);
@@ -224,6 +230,9 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /textInput\("name", "例如 测试"\)/);
   assert.match(client, /button\("登出"/);
   assert.match(client, /class: "admin-system-panel"/);
+  assert.match(client, /state\.workspaceViewers\[workspace\.id\]/);
+  assert.match(client, /class: "workspace-presence"/);
+  assert.match(client, /"data-state": viewerCount > 0 \? "online" : "offline"/);
   assert.match(client, /href: "\/admin\/maintenance\/"/);
   assert.match(client, /rel: "noopener noreferrer"/);
   assert.match(client, /打开管理员浏览器/);
@@ -234,6 +243,8 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /projectImportResults\.open = false/);
   assert.match(client, /class: "stack admin-item-list"/);
   assert.match(styles, /\.admin-item-list,\n\.project-import-list \{\n  max-height:/);
+  assert.match(styles, /\.workspace-presence\[data-state="online"\]/);
+  assert.match(server, /workspaceViewers: broker\.viewerCountsByWorkspace\(\)/);
   assert.doesNotMatch(client, /href: "\/admin\/"/);
   assert.doesNotMatch(client, /button\("退出管理"/);
   assert.doesNotMatch(styles, /\.topbar\s*\{[^}]*border-(?:top|bottom)/);

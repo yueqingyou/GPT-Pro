@@ -160,10 +160,9 @@ curl -fsS http://127.0.0.1:36090/healthz
     "droppedFrames": 0,
     "throttledFrames": 2130,
     "streamRestarts": 18,
-    "streamTier": "congested",
-    "streamMaxWidth": 800,
-    "streamMaxHeight": 500,
-    "streamQuality": 60
+    "streamMaxWidth": 2560,
+    "streamMaxHeight": 1600,
+    "streamQuality": 72
   }
 }
 ```
@@ -182,25 +181,18 @@ curl -fsS http://127.0.0.1:36090/healthz
 - `frames`：网关已接受并交付的源帧数；
 - `droppedFrames`：因客户端发送缓冲过高而主动丢弃的过期帧计数；
 - `throttledFrames`：已及时确认、但因可见页面帧率上限而未继续发送的源帧数；
-- `streamRestarts`：观看者可见性或自适应画质档位变化后重启源流的次数；
-- `streamTier` / `streamMaxWidth` / `streamMaxHeight` / `streamQuality`：当前按可见工作区数量选择的源流档位、最大尺寸与 JPEG 质量。
+- `streamRestarts`：观看者可见性、viewport 调整或连接恢复后重启源流的次数；
+- `streamMaxWidth` / `streamMaxHeight` / `streamQuality`：所有可见工作区共用的源流最大尺寸与 JPEG 质量；实际帧尺寸不超过当前 viewport。
 
 网关进程即使在 Chromium 短暂重启时仍可提供管理页，因此容器健康检查不以 `connected` 为唯一生死条件；运行验收应同时检查该字段与 `targets == workspaces`。
 
-## 十二窗口画面压力基线
+## 画面资源边界
 
 当前画面调度默认为：普通页面可见时交付上限 60 FPS，并持续交付 Chromium 产生的全部源帧；隐藏时停止 `Page.startScreencast` 并最小化远端窗口，重新可见后立即恢复。网关按真实经过时间累积可见工作区帧预算，不假设 Chromium 固定输出 60 FPS。源帧立即 ACK，慢客户端只丢弃过期帧。
 
-源流尺寸与质量按可见工作区数量选择：一个窗口最高 `2560×1600` / 质量 90，二至四个为 `1280×800` / 70，五至八个为 `960×600` / 66，九个及以上为 `800×500` / 60。`JPEG_QUALITY` 还会继续限制质量。页面 viewport 不随源流降档，而是跟随当前访问页面的实际尺寸；输入坐标与远端布局保持一致。
+所有可见工作区统一使用最高 `2560×1600` 的源流上限和 `JPEG_QUALITY` 配置的 JPEG 质量；实际源帧不超过当前访问页面的 viewport。其它工作区变为可见时不会再重启当前源流或降低分辨率与压缩质量；输入坐标与远端布局继续跟随 viewport。
 
-2026-08-20 参考实验使用 20 逻辑核、32 GiB 主机，Docker 虚拟环境向容器显示 7.75 GiB。完整链路包含 desktop、gateway、真实 WebSocket 客户端和持续 DOM/变换动画，配置为 JPEG 72、可见窗口 60 FPS 上限。下表保留与当前调度契约一致的实得值。
-
-| 场景 | 实得帧率 | 总客户端带宽 | 资源观察 | 网关背压丢帧 |
-| --- | --- | --- | --- | --- |
-| 1 个可见动态工作区 | 38.30 FPS | 0.87 MiB/s | 未单独采样 | 0 |
-| 12 个可见动态工作区 | 每窗 9.20–11.60 FPS | 0.95 MiB/s | desktop 约 172–192% CPU / 1.17–1.26 GiB；gateway 越过建连尖峰后约 11–14% CPU / 63–71 MiB | 0 |
-
-十二个可见窗口的客户端交付速率与页面自身 9.27–11.67 FPS 的动画速率基本一致，说明此时瓶颈是单个 headful Chromium 对十二个同时动态窗口的渲染调度，而不是网关串行、限速或背压。`FRAME_ACTIVE_FPS=60` 只是上限；在“一只 Chromium 进程、一份 Profile、一次登录”约束内，无法把十二个操作系统后台窗口变成十二只独立前台浏览器进程。合成页结果也不能替代十二个真实已登录 ChatGPT 对话的长期容量验收。
+固定画质会让多个可见窗口共享更高的渲染与 JPEG 编码负载。`FRAME_ACTIVE_FPS=60` 只是上限；在“一只 Chromium 进程、一份 Profile、一次登录”约束内，实得帧率仍受共享渲染、CPU、内存和带宽限制。修改画质策略后必须重新记录一个、六个与十二个可见工作区的实得帧率、CPU、内存、带宽和背压丢帧，不得沿用低分辨率档位下的历史数据。
 
 ## 日志
 

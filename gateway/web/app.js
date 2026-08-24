@@ -2,6 +2,7 @@ import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "./text
 
 const app = globalThis.document?.querySelector("#app") || null;
 const IN_PAGE_NOTICE_MS = 5000;
+const VIEWER_REPLACED_CLOSE_CODE = 4000;
 
 const icon = () => node("span", { class: "brand-mark", "aria-hidden": "true" }, "✦");
 
@@ -655,6 +656,8 @@ async function renderAdmin() {
 
   const workspaceList = node("div", { class: "stack admin-item-list" });
   for (const workspace of state.workspaces) {
+    const viewerCount = state.workspaceViewers[workspace.id] || 0;
+    const presenceText = viewerCount > 1 ? `在线 · ${viewerCount} 个窗口` : viewerCount === 1 ? "在线" : "离线";
     const name = textInput("name", "名称", { value: workspace.name });
     const startUrl = textInput("startUrl", "https://chatgpt.com/…", { value: workspace.startUrl });
     const save = button("保存", { class: "button small" });
@@ -687,7 +690,7 @@ async function renderAdmin() {
     workspaceList.append(
       node(
         "details",
-        { class: "item-card item-details" },
+        { class: "item-card item-details workspace-item" },
         node(
           "summary",
           {},
@@ -696,6 +699,15 @@ async function renderAdmin() {
             { class: "item-summary-main" },
             node("strong", {}, workspace.name),
             node("code", {}, workspace.id),
+          ),
+          node(
+            "span",
+            {
+              class: "workspace-presence",
+              "data-state": viewerCount > 0 ? "online" : "offline",
+              title: viewerCount > 0 ? `${viewerCount} 个普通用户窗口已连接` : "没有普通用户窗口连接",
+            },
+            presenceText,
           ),
         ),
         node(
@@ -1057,6 +1069,25 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     });
   };
 
+  const showReplacedPage = () => {
+    intentionalClose = true;
+    clearTimeout(noticeTimer);
+    document.removeEventListener("visibilitychange", sendViewerState);
+    nativeInput.blur();
+    replace(
+      shell(
+        "当前窗口已停止",
+        "此用户已在其他窗口打开工作区，本窗口已停止画面与输入。",
+        node(
+          "section",
+          { class: "card auth-card" },
+          node("p", { class: "muted" }, "如需在这里继续，重新载入后会接管另一个窗口。"),
+          button("在此窗口继续", { onClick: () => location.reload() }),
+        ),
+      ),
+    );
+  };
+
   const setStatus = (text, state = "") => {
     statusText.textContent = text;
     status.dataset.state = state;
@@ -1167,7 +1198,11 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       }
       drawNewestFrame(event.data);
     });
-    socket.addEventListener("close", async () => {
+    socket.addEventListener("close", async (event) => {
+      if (event.code === VIEWER_REPLACED_CLOSE_CODE) {
+        showReplacedPage();
+        return;
+      }
       if (intentionalClose) return;
       setStatus("连接中断，正在重试…", "error");
       reconnects += 1;

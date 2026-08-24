@@ -33,7 +33,8 @@ client /w/project-n/ ── path-scoped login ─┘                         │
 administrator ─▶ /admin/maintenance/ ─▶ full KasmVNC Chromium browser
 ```
 
-- Workspaces and users are created dynamically from persistent data. Add as many as the host can sustain.
+- Workspaces and users are created dynamically from persistent data. Add as many as the host can sustain. The authenticated management page permanently marks every collapsed workspace row as online or offline and shows the connection count when a workspace has multiple ordinary viewer windows.
+- Each ordinary gateway user has exactly one active viewer connection across all assigned workspaces. A newly opened window takes over immediately; the previous page stops its screen stream and input and does not reconnect automatically. Different users can remain online concurrently, including in the same workspace.
 - A workspace Target is tagged inside its top-level window. A gateway restart reclaims existing windows; a Chromium restart recreates them from each saved last URL.
 - A client window at `/w/<workspace-id>/` receives a path-scoped HttpOnly cookie. Different workspace paths can therefore remain logged in as different gateway users in the same local browser profile.
 - Mouse, keyboard and text insertion are sent with that workspace's CDP `sessionId`; clients never receive a raw Target ID or DevTools credential.
@@ -81,7 +82,7 @@ Suppose the administrator creates:
 | `/w/lab-project/` | `lab-login` + its password | another persistent page |
 | `/w/home-review/` | any assigned user | another persistent page |
 
-All three URLs can be open simultaneously in one local Chromium profile. Signing in to `/w/lab-project/` does not replace the cookie for `/w/office-project/`, and input is sent to the selected Target only. They still share one remote ChatGPT login because all Targets live in the same remote profile.
+All three URLs can be open simultaneously when they use different local users. Path-scoped cookies can remain logged in at more than one workspace, but opening a new viewer with the same local user stops that user's previous viewer and takes over. Different users still share one remote ChatGPT login because all Targets live in the same remote profile.
 
 ## Configuration
 
@@ -135,7 +136,7 @@ Current limitations:
 
 - rich-text, image and file clipboard formats are not mirrored; selections and ChatGPT message-copy buttons transfer plain text only;
 - audio, microphone and ChatGPT voice mode are not streamed;
-- multiple simultaneous viewers of the same workspace share one viewport;
+- different users connected to the same workspace share one viewport;
 - continuous Chromium streams still consume shared rendering, JPEG encoding, CPU, RAM and bandwidth; visible viewers use `FRAME_ACTIVE_FPS`, and hiding a page stops its stream;
 - notifications relay only while the ordinary page remains open and connected; closed pages and offline devices receive no backlog;
 - configured FPS is a sampling and delivery ceiling rather than a delivered-rate guarantee; shared Chromium rendering and encoding remain the limit when many pages change together;
@@ -153,6 +154,7 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 - The gateway no longer mounts `/var/run/docker.sock`.
 - Passwords use per-user salted scrypt hashes. Session and state files are created with private permissions.
 - Login attempts are rate-limited. Changing a password, disabling a user or changing workspace assignments revokes that user's sessions and sockets.
+- One ordinary user can keep only one active workspace WebSocket. A new connection replaces the previous one across workspace paths; the old page stops instead of reconnecting, while its path-scoped login remains available for an explicit takeover.
 - Project import captures only the authorized sidebar response emitted by a ChatGPT page in the shared Profile; it never reads or replays a login token. It refuses import when pagination is required or the response shape changes.
 - The exact-name composer-tool allowlist and sensitive-operation policy are persistent and apply only to managed workspace Targets. Sharing is an invariant ordinary-workspace restriction; the administrator browser remains unrestricted. Because website labels, DOM structure and endpoints can change, the administrator should review these controls after major ChatGPT UI changes.
 - Hiding and blocking an unlisted ChatGPT app is not account-level revocation of a third-party OAuth grant. To remove an existing GitHub, Notion, Gmail or other connection, the administrator must still use **Settings > Apps > Disconnect** in ChatGPT.
@@ -164,9 +166,9 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 
 ## Resource behavior
 
-There is no application-level two-workspace limit and no arbitrary fixed maximum. Every workspace has its own top-level window and `Page.startScreencast` stream. The gateway retains one last image per workspace; WebSocket backpressure and client-side newest-frame coalescing keep slow links bounded. Stream profiles adapt to the number of visible workspaces: one uses up to `2560×1600`, two to four use `1280×800`, five to eight use `960×600`, and nine or more use `800×500`; JPEG quality caps are 90, 70, 66 and 60 respectively, further limited by `JPEG_QUALITY`.
+There is no application-level two-workspace limit and no arbitrary fixed maximum. Every workspace has its own top-level window and `Page.startScreencast` stream. The gateway retains one last image per workspace; WebSocket backpressure and client-side newest-frame coalescing keep slow links bounded. Every visible workspace uses the same source-stream ceiling of `2560×1600` and the JPEG quality configured by `JPEG_QUALITY`; an actual source frame never exceeds that access page's current viewport, and other visible workspaces no longer reduce its clarity.
 
-The maintained regression baseline is twelve local users, each assigned one workspace, with `FRAME_ACTIVE_FPS=60` and `JPEG_QUALITY=72`. On the reference Docker host, one dynamic ordinary window delivered 38.30 FPS at 0.87 MiB/s. Twelve visible dynamic windows delivered 9.20–11.60 FPS each at 0.95 MiB/s total, with zero gateway backpressure drops; the desktop used about 172–192% CPU and 1.17–1.26 GiB, while the gateway settled near 11–14% CPU and 63–71 MiB after its connection-startup spike. `FRAME_ACTIVE_FPS=60` remains a ceiling: one headful Chromium process cannot make twelve OS-background windows render like twelve separate foreground browser processes. These synthetic results do not promise the capacity of twelve real signed-in ChatGPT conversations.
+The defaults are `FRAME_ACTIVE_FPS=60` and `JPEG_QUALITY=72`. `FRAME_ACTIVE_FPS=60` remains a ceiling: multiple high-resolution dynamic windows still share one headful Chromium renderer, JPEG encoding, CPU, RAM and bandwidth. Fixed clarity does not guarantee delivery at the configured frame-rate ceiling, and twelve real signed-in ChatGPT conversations still require long-running acceptance on the deployment host.
 
 ## Verification and development
 
@@ -179,7 +181,7 @@ docker compose up -d --build --wait
 curl -fsS http://127.0.0.1:36090/healthz
 ```
 
-The automated suite covers twelve-user dynamic configuration, Project preview and atomic batch import, permission isolation, path-scoped sessions, native text/IME, per-viewer selections and concurrent native copy ownership, workspace-scoped native web-notification relay and ordinary HTTP in-page presentation, the exact-name composer-tool allowlist, sensitive-operation guards, pre-input sharing and project-link rejection, project-home return, twelve independent window screencasts and slow-viewer backpressure, CDP Target/session routing, upload/download authorization, Target reclamation after a gateway restart, global timezone/language application, egress-detection failure handling, CSRF/Origin rejection and Compose structure. Runtime acceptance additionally requires a real Docker/Chromium host. A real ChatGPT Pro end-to-end acceptance still requires the operator to perform the one authorized ChatGPT login; no credentials are bundled or automated.
+The automated suite covers twelve-user dynamic configuration, Project preview and atomic batch import, permission isolation, path-scoped sessions, single-active-viewer takeover, native text/IME, per-viewer selections and concurrent native copy ownership, workspace-scoped native web-notification relay and ordinary HTTP in-page presentation, the exact-name composer-tool allowlist, sensitive-operation guards, pre-input sharing and project-link rejection, project-home return, twelve independent window screencasts and slow-viewer backpressure, CDP Target/session routing, upload/download authorization, Target reclamation after a gateway restart, global timezone/language application, egress-detection failure handling, CSRF/Origin rejection and Compose structure. Runtime acceptance additionally requires a real Docker/Chromium host. A real ChatGPT Pro end-to-end acceptance still requires the operator to perform the one authorized ChatGPT login; no credentials are bundled or automated.
 
 See [Deploy.md](Deploy.md) for deployment, data, health and recovery details.
 

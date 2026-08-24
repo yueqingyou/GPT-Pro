@@ -1643,7 +1643,7 @@ class FakeViewer {
   }
 }
 
-test("十二个独立窗口并行推流且慢客户端不累积帧", async () => {
+test("十二个独立窗口并行使用统一画质且慢客户端不累积帧", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-screencast-"));
   const store = createStateStore({ file: join(directory, "state.json") });
   for (let index = 1; index <= 12; index += 1) {
@@ -1653,6 +1653,7 @@ test("十二个独立窗口并行推流且慢客户端不累积帧", async () =>
   const broker = new WorkspaceBroker({
     store,
     activeFrameFps: 10,
+    viewport: { width: 2560, height: 1600 },
     connect: async () => connection,
     logger: { warn() {}, error() {} },
   });
@@ -1665,8 +1666,8 @@ test("十二个独立窗口并行推流且慢客户端不累积帧", async () =>
     assert.equal(starts.length, 12);
     assert.equal(new Set(starts.map((call) => call.sessionId)).size, 12);
     assert.ok(starts.every((call) => !("everyNthFrame" in call.params)));
-    assert.ok(starts.every((call) => call.params.maxWidth === 800 && call.params.maxHeight === 500));
-    assert.ok(starts.every((call) => call.params.quality === 60));
+    assert.ok(starts.every((call) => call.params.maxWidth === 2560 && call.params.maxHeight === 1600));
+    assert.ok(starts.every((call) => call.params.quality === 72));
     starts.forEach((call) => connection.emitFrame(call.sessionId));
     await new Promise((resolveWait) => setImmediate(resolveWait));
     assert.equal(connection.calls.some((call) => call.method === "Target.activateTarget"), false);
@@ -1677,8 +1678,16 @@ test("十二个独立窗口并行推流且慢客户端不累积帧", async () =>
     assert.ok(viewers.every((viewer) => viewer.frames > 0));
     assert.equal(slow.frames, 0);
     assert.equal(broker.status().captureMode, "target-screencast");
-    assert.equal(broker.status().streamTier, "congested");
+    assert.equal(broker.status().streamMaxWidth, 2560);
+    assert.equal(broker.status().streamMaxHeight, 1600);
+    assert.equal(broker.status().streamQuality, 72);
     assert.equal(broker.status().capturing, 12);
+    assert.deepEqual(
+      broker.viewerCountsByWorkspace(),
+      Object.fromEntries(
+        Array.from({ length: 12 }, (_, index) => [`workspace-${index + 1}`, index === 0 ? 2 : 1]),
+      ),
+    );
     assert.ok(broker.status().droppedFrames > 0);
     assert.equal(connection.calls.filter((call) => call.method === "Page.screencastFrameAck").length, 12);
   } finally {
@@ -1720,7 +1729,9 @@ test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => 
     assert.equal("heartbeatFrames" in broker.status(), false);
     assert.equal(broker.status().visibleViewers, 1);
     assert.equal(broker.status().activeFrameFps, 60);
-    assert.equal(broker.status().streamTier, "full");
+    assert.equal(broker.status().streamMaxWidth, 2560);
+    assert.equal(broker.status().streamMaxHeight, 1600);
+    assert.equal(broker.status().streamQuality, 72);
     await broker.handleCommand("active", { type: "viewerState", visible: false }, null, viewer);
     assert.equal(broker.status().visibleViewers, 0);
     assert.equal(broker.status().capturing, 0);
@@ -1729,6 +1740,15 @@ test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => 
     assert.equal(broker.status().visibleViewers, 1);
     const resumedStart = connection.calls.filter((call) => call.method === "Page.startScreencast").at(-1);
     assert.equal("everyNthFrame" in resumedStart.params, false);
+    broker.removeViewer("active", viewer);
+    await assert.rejects(
+      () => broker.handleCommand("active", { type: "text", text: "STALE_INPUT" }, null, viewer),
+      /画面连接不属于当前工作区/,
+    );
+    assert.equal(
+      connection.calls.some((call) => call.method === "Input.insertText" && call.params.text === "STALE_INPUT"),
+      false,
+    );
   } finally {
     broker.removeViewer("active", viewer);
     broker.stop();
