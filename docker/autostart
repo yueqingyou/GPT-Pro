@@ -3,6 +3,14 @@ set -eu
 
 export LIBGL_ALWAYS_SOFTWARE=1
 export DISPLAY="${DISPLAY:-:1}"
+export XDG_CURRENT_DESKTOP=GPTPro
+XDG_RUNTIME_DIR="/tmp/gpc-runtime-$(id -u)"
+export XDG_RUNTIME_DIR
+
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 0700 "${XDG_RUNTIME_DIR}"
+eval "$(dbus-launch --autolaunch="$(cat /var/lib/dbus/machine-id)" --sh-syntax)"
+dbus-update-activation-environment DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR
 
 IFS= read -r PROXY_URL < /config/.gpc-proxy
 IFS= read -r START_URL < /config/.gpc-start-url
@@ -18,6 +26,15 @@ EOF
 xsettingsd --config=/config/.xsettingsd 2>/dev/null &
 
 python3 /usr/local/bin/gpc-cdp-fwd >/tmp/gpc-cdp-fwd.log 2>&1 &
+python3 /usr/local/bin/gpc-file-portal >/tmp/gpc-file-portal.log 2>&1 &
+/usr/libexec/xdg-desktop-portal >/tmp/xdg-desktop-portal.log 2>&1 &
+
+attempt=0
+while [ ! -S /run/gpc/desktop.sock ] && [ "${attempt}" -lt 100 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+test -S /run/gpc/desktop.sock
 
 rm -f /config/chromium/SingletonLock /config/chromium/SingletonSocket /config/chromium/SingletonCookie
 

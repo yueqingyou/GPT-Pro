@@ -7,6 +7,7 @@ import { WebSocketServer } from "ws";
 import { createLoginLimiter, createSessionStore, createSessionToken, readSession } from "../lib/auth.mjs";
 import { WorkspaceBroker } from "../lib/cdp.mjs";
 import { createSocketHub, kickLiveSession } from "../lib/kick.mjs";
+import { FilePortalBridge } from "../lib/portal.mjs";
 import { manualBrowserProfile, resolveAutomaticBrowserProfile } from "../lib/profile.mjs";
 import { createStateStore, WORKSPACE_ID_RE } from "../lib/store.mjs";
 import { createTransferStore } from "../lib/transfers.mjs";
@@ -17,6 +18,7 @@ const ADMIN_COOKIE = "gpc_admin_session";
 const WORKSPACE_COOKIE = "gpc_workspace_session";
 const VIEWER_REPLACED_CLOSE_CODE = 4000;
 const VIEWER_REPLACED_CLOSE_REASON = "replaced";
+const VIEWER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_HANDOFF_TTL_MS = 30 * 1000;
 const BODY_LIMIT = 64 * 1024;
@@ -203,6 +205,7 @@ export function createGateway({
   broker,
   sessions,
   transfers = null,
+  portal = null,
   webDir = DEFAULT_WEB,
   maintenanceTarget = "http://desktop:3000",
   maintenanceHostPort = 36091,
@@ -805,9 +808,16 @@ export function createGateway({
   });
 
   webSockets.on("connection", (socket, _request, context) => {
-    const { workspaceId, user } = context;
-    const previousSocket = liveSockets.add(user.id, socket);
-    if (previousSocket) previousSocket.close(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON);
+    const { workspaceId, user, viewerId, takeover } = context;
+    const ownership = liveSockets.add(user.id, viewerId, workspaceId, socket, takeover);
+    if (!ownership.accepted) {
+      socket.close(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON);
+      return;
+    }
+    if (ownership.previous) {
+      broker.removeViewer(ownership.previous.workspaceId, ownership.previous.socket);
+      ownership.previous.socket.close(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON);
+    }
     let queue = Promise.resolve();
     let queuedCommands = 0;
     socket.on("message", (data, isBinary) => {
@@ -851,7 +861,8 @@ export function createGateway({
       return;
     }
     const route = workspaceRoute(url.pathname);
-    if (!route || route.suffix !== "/socket" || !WORKSPACE_ID_RE.test(route.id)) {
+    const viewerId = String(url.searchParams.get("viewer") || "");
+    if (!route || route.suffix !== "/socket" || !WORKSPACE_ID_RE.test(route.id) || !VIEWER_ID_RE.test(viewerId)) {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
@@ -863,7 +874,12 @@ export function createGateway({
       return;
     }
     webSockets.handleUpgrade(req, socket, head, (webSocket) => {
-      webSockets.emit("connection", webSocket, req, { workspaceId: route.id, user: session.user });
+      webSockets.emit("connection", webSocket, req, {
+        workspaceId: route.id,
+        user: session.user,
+        viewerId,
+        takeover: url.searchParams.get("takeover") === "1",
+      });
     });
   });
 
@@ -922,17 +938,19 @@ export function createGateway({
     maintenanceServer,
     broker,
     async start(port = 8080, host = "0.0.0.0", maintenancePort = 0) {
-      await new Promise((resolveStart, reject) => {
-        server.once("error", reject);
-        server.listen(port, host, resolveStart);
-      });
+      await portal?.start();
       try {
+        await new Promise((resolveStart, reject) => {
+          server.once("error", reject);
+          server.listen(port, host, resolveStart);
+        });
         await new Promise((resolveStart, reject) => {
           maintenanceServer.once("error", reject);
           maintenanceServer.listen(maintenancePort, host, resolveStart);
         });
       } catch (error) {
-        await new Promise((resolveStop) => server.close(resolveStop));
+        if (server.listening) await new Promise((resolveStop) => server.close(resolveStop));
+        await portal?.stop();
         throw error;
       }
       broker.start();
@@ -957,6 +975,7 @@ export function createGateway({
       maintenanceSockets.clear();
       broker.setMaintenanceActive(false);
       broker.stop();
+      await portal?.stop();
       for (const socket of webSockets.clients) socket.terminate();
       webSockets.close();
       maintenanceProxy.close();
@@ -985,9 +1004,16 @@ export function createDefaultGateway(env = process.env) {
     ownerUid: Number(env.PUID || 1000),
     ownerGid: Number(env.PGID || 1000),
   });
+  const portal = new FilePortalBridge({
+    gatewaySocket: env.PORTAL_GATEWAY_SOCKET || "/run/gpc/gateway.sock",
+    desktopSocket: env.PORTAL_DESKTOP_SOCKET || "/run/gpc/desktop.sock",
+    ownerUid: Number(env.PUID || 1000),
+    ownerGid: Number(env.PGID || 1000),
+  });
   const broker = new WorkspaceBroker({
     store,
     transferStore: transfers,
+    portal,
     endpoint: env.DESKTOP_CDP || "http://desktop:9223",
     activeFrameFps: Number(env.FRAME_ACTIVE_FPS || 60),
     jpegQuality: Number(env.JPEG_QUALITY || 72),
@@ -1011,6 +1037,7 @@ export function createDefaultGateway(env = process.env) {
     sessions,
     broker,
     transfers,
+    portal,
     maintenanceTarget: env.DESKTOP_VNC || "http://desktop:3000",
     maintenanceHostPort: Number(env.MAINTENANCE_HOST_PORT || 36091),
     vncUser: env.VNC_USER || "abc",

@@ -66,7 +66,7 @@ test("业务代码使用动态工作区路径 Cookie", () => {
   assert.match(server, /workspaceId/);
 });
 
-test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流", () => {
+test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件", () => {
   const pkg = JSON.parse(read("package.json"));
   assert.ok(pkg.dependencies.ws);
   const cdp = read("lib/cdp.mjs");
@@ -82,13 +82,23 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(cdp, /Network\.getResponseBody/);
   assert.match(cdp, /listChatGptProjects/);
   assert.doesNotMatch(cdp, /Fetch\./);
-  assert.match(cdp, /DOM\.setFileInputFiles/);
-  assert.match(cdp, /Page\.fileChooserOpened/);
+  assert.doesNotMatch(cdp, /DOM\.setFileInputFiles/);
+  assert.doesNotMatch(cdp, /Page\.fileChooserOpened/);
+  assert.doesNotMatch(cdp, /Page\.setInterceptFileChooserDialog/);
   assert.match(cdp, /fileChooserOwner/);
   assert.match(cdp, /command\.type === "selectFiles"/);
   assert.match(cdp, /command\.type === "cancelFileSelection"/);
   assert.match(cdp, /resolveUserUploads/);
   assert.doesNotMatch(cdp, /attachFiles|pendingUploads|input\[type='file'\]/);
+  const portal = read("lib/portal.mjs");
+  assert.match(portal, /gatewaySocket/);
+  assert.match(portal, /desktopSocket/);
+  assert.match(read("gateway/server.mjs"), /\/run\/gpc\/gateway\.sock/);
+  assert.match(read("gateway/server.mjs"), /\/run\/gpc\/desktop\.sock/);
+  assert.match(portal, /tagWorkspace/);
+  assert.match(read("docker/file-portal.py"), /org\.freedesktop\.impl\.portal\.FileChooser/);
+  assert.match(read("docker/file-portal.py"), /_GPC_WORKSPACE_ID/);
+  assert.match(read("docker/gptpro-portals.conf"), /FileChooser=gpc/);
   assert.match(cdp, /Browser\.setDownloadBehavior/);
   assert.match(cdp, /Page\.startScreencast/);
   assert.match(cdp, /Page\.screencastFrameAck/);
@@ -152,7 +162,13 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /VIEWER_REPLACED_CLOSE_CODE = 4000/);
   assert.match(client, /当前窗口已停止/);
   assert.match(client, /event\.code === VIEWER_REPLACED_CLOSE_CODE/);
-  assert.match(server, /previousSocket\.close\(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON\)/);
+  assert.match(client, /crypto\.randomUUID\(\)/);
+  assert.match(client, /takeover=\$\{takeover \? "1" : "0"\}/);
+  assert.match(client, /if \(socket !== currentSocket\) return/);
+  assert.match(client, /reconnectTimer = setTimeout\(connect/);
+  assert.match(server, /liveSockets\.add\(user\.id, viewerId, workspaceId, socket, takeover\)/);
+  assert.match(server, /broker\.removeViewer\(ownership\.previous\.workspaceId, ownership\.previous\.socket\)/);
+  assert.match(server, /ownership\.previous\.socket\.close\(VIEWER_REPLACED_CLOSE_CODE, VIEWER_REPLACED_CLOSE_REASON\)/);
   assert.match(client, /copyClipboardText/);
   assert.match(client, /button: pressedPointerButton\(event\.buttons\)/);
   assert.match(client, /sendPendingPointerMove\(\);\n\s+sendPointer\(event, "mouseReleased"\);\n\s+send\(\{ type: "selection" \}\)/);
@@ -212,6 +228,7 @@ test("网关通过 CDP sessionId 定向输入、文件和独立窗口连续流",
   assert.match(client, /已保存到私人文件区/);
   assert.match(client, /type: "selectFiles"/);
   assert.match(client, /type: "cancelFileSelection"/);
+  assert.match(client, /requestId: fileSelection\.requestId/);
   const uploadHandlerStart = client.indexOf('uploadInput.addEventListener("change"');
   const uploadHandlerEnd = client.indexOf('const downloads = button("\u67e5\u770b\u6587\u4ef6"');
   assert.ok(uploadHandlerStart >= 0 && uploadHandlerEnd > uploadHandlerStart);
@@ -294,6 +311,10 @@ test("管理员浏览器保留完整 Chromium 界面与扩展管理能力", () =
   assert.match(hideKasm, /<title>GPT Pro<\/title>/);
   assert.doesNotMatch(hideKasm, /<title>ChatGPT<\/title>/);
   assert.match(adminBrowser, /noVNC_setting_enable_ime/);
+  assert.match(adminBrowser, /installAdministratorPaste/);
+  assert.match(adminBrowser, /event\.clipboardData\?\.getData\("text\/plain"\)/);
+  assert.match(adminBrowser, /clipboardInput\.dispatchEvent\(new EventCtor\("change"/);
+  assert.match(adminBrowser, /code: "KeyV", ctrlKey: true/);
   assert.match(textInput, /shouldForwardKey/);
   assert.doesNotMatch(server, /api\/ime\/candidates|pinyin/);
 });

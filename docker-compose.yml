@@ -57,9 +57,12 @@ services:
       PROFILE_GEO_TIMEOUT_MS: ${PROFILE_GEO_TIMEOUT_MS:-5000}
       PROFILE_TIMEZONE: ${PROFILE_TIMEZONE:-}
       PROFILE_LOCALE: ${PROFILE_LOCALE:-}
+      PORTAL_GATEWAY_SOCKET: /run/gpc/gateway.sock
+      PORTAL_DESKTOP_SOCKET: /run/gpc/desktop.sock
     volumes:
       - ./data-panel:/data
       - ./data-transfer:/transfer
+      - portal-runtime:/run/gpc
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-36090}:8080"
       - "127.0.0.1:${MAINTENANCE_PORT:-36091}:8081"
@@ -100,10 +103,11 @@ services:
     volumes:
       - ./data/browser:/config
       - ./data-transfer:/transfer
+      - portal-runtime:/run/gpc
     shm_size: "1gb"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9222/json/version >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f '/usr/local/bin/gpc-file-portal' >/dev/null && pgrep -f '^/usr/libexec/xdg-desktop-portal$' >/dev/null && test -S /run/gpc/desktop.sock && curl -fsS http://127.0.0.1:9222/json/version >/dev/null"]
       interval: 10s
       timeout: 4s
       retries: 12
@@ -117,3 +121,4 @@ services:
 volumes:
   caddy-data:
   caddy-config:
+  portal-runtime:

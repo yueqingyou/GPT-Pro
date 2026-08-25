@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
-import { CdpConnection, WorkspaceBroker } from "../lib/cdp.mjs";
+import { CdpConnection, WorkspaceBroker as RuntimeWorkspaceBroker } from "../lib/cdp.mjs";
 import { manualBrowserProfile } from "../lib/profile.mjs";
 import { createStateStore } from "../lib/store.mjs";
 
@@ -100,6 +100,40 @@ class FakeConnection extends EventEmitter {
     if (!this.open) return;
     this.open = false;
     this.emit("disconnect", new Error("terminated"));
+  }
+}
+
+class FakePortal extends EventEmitter {
+  constructor() {
+    super();
+    this.workspaceTags = [];
+    this.administratorTags = 0;
+    this.selections = [];
+    this.cancellations = [];
+  }
+
+  async tagWorkspace(tag) {
+    this.workspaceTags.push(tag);
+  }
+
+  async tagAdministrator() {
+    this.administratorTags += 1;
+  }
+
+  select(requestId, paths) {
+    this.selections.push({ requestId, paths });
+    return true;
+  }
+
+  cancel(requestId) {
+    this.cancellations.push(requestId);
+    return true;
+  }
+}
+
+class WorkspaceBroker extends RuntimeWorkspaceBroker {
+  constructor(options) {
+    super({ portal: new FakePortal(), ...options });
   }
 }
 
@@ -1487,7 +1521,7 @@ test("项目导航和分享在输入发送前由网关拒绝且可返回项目�
   }
 });
 
-test("只有页面手动打开文件选择后才能选择用户私人文件", async () => {
+test("只有普通用户手动触发原生 Portal 后才能选择私人文件", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-upload-"));
   const store = createStateStore({ file: join(directory, "state.json") });
   store.createWorkspace({ id: "office", name: "Office", startUrl: "https://chatgpt.com/" });
@@ -1530,47 +1564,54 @@ test("只有页面手动打开文件选择后才能选择用户私人文件", as
     };
     await broker.addViewer("office", viewer);
     await broker.addViewer("office", otherViewer);
-    const command = { type: "selectFiles", uploadIds: ["upload-12345678"] };
     const actor = { id: "user-1", role: "member" };
     await assert.rejects(
-      () => broker.handleCommand("office", command, actor, viewer),
+      () => broker.handleCommand(
+        "office",
+        {
+          type: "selectFiles",
+          requestId: "11111111-1111-4111-8111-111111111111",
+          uploadIds: ["upload-12345678"],
+        },
+        actor,
+        viewer,
+      ),
       /请先在 ChatGPT 页面点击上传文件/,
     );
     const runtime = broker.runtimes.get("office");
-    runtime.fileChooser = { backendNodeId: 1, openedAt: Date.now(), userId: actor.id, viewer };
-    connection.emit("event", {
-      method: "Page.fileChooserOpened",
-      sessionId: runtime.sessionId,
-      params: { backendNodeId: 90209, mode: "selectSingle" },
+    broker.portal.emit("open", {
+      requestId: "11111111-1111-4111-8111-111111111111",
+      workspaceId: "office",
+      multiple: false,
+      directory: false,
     });
     assert.equal(runtime.fileChooser, null);
-    assert.ok(
-      connection.calls.some(
-        (call) => call.method === "Page.setInterceptFileChooserDialog" && call.params.cancel === true,
-      ),
-    );
+    assert.deepEqual(broker.portal.cancellations, ["11111111-1111-4111-8111-111111111111"]);
     await broker.handleCommand(
       "office",
       { type: "pointer", event: "mousePressed", x: 20, y: 30, button: "left" },
       actor,
       viewer,
     );
-    connection.emit("event", {
-      method: "Page.fileChooserOpened",
-      sessionId: runtime.sessionId,
-      params: { backendNodeId: 90210, mode: "selectSingle" },
+    const requestId = "22222222-2222-4222-8222-222222222222";
+    broker.portal.emit("open", {
+      requestId,
+      workspaceId: "office",
+      multiple: false,
+      directory: false,
     });
     assert.equal(viewer.messages.some((message) => message.type === "file-chooser"), true);
     assert.equal(otherViewer.messages.some((message) => message.type === "file-chooser"), false);
+    const command = { type: "selectFiles", requestId, uploadIds: ["upload-12345678"] };
     await assert.rejects(
       () => broker.handleCommand("office", command, actor, otherViewer),
       /不属于当前用户/,
     );
     await broker.handleCommand("office", command, actor, viewer);
-    const injected = connection.calls.find((call) => call.method === "DOM.setFileInputFiles");
-    assert.deepEqual(injected.params.files, ["/transfer/uploads/user-1/private/data.txt"]);
-    assert.equal(injected.params.backendNodeId, 90210);
-    assert.match(injected.sessionId, /^upload-session-upload-target-/);
+    assert.deepEqual(broker.portal.selections, [
+      { requestId, paths: ["/transfer/uploads/user-1/private/data.txt"] },
+    ]);
+    assert.equal(connection.calls.some((call) => call.method === "DOM.setFileInputFiles"), false);
     assert.equal(connection.calls.some((call) => call.params?.expression?.includes("input[type='file']")), false);
 
     await broker.handleCommand(
@@ -1579,32 +1620,40 @@ test("只有页面手动打开文件选择后才能选择用户私人文件", as
       actor,
       viewer,
     );
-    connection.emit("event", {
-      method: "Page.fileChooserOpened",
-      sessionId: runtime.sessionId,
-      params: { backendNodeId: 90211, mode: "selectMultiple" },
+    const cancelRequestId = "33333333-3333-4333-8333-333333333333";
+    broker.portal.emit("open", {
+      requestId: cancelRequestId,
+      workspaceId: "office",
+      multiple: true,
+      directory: false,
     });
-    await broker.handleCommand("office", { type: "cancelFileSelection" }, actor, viewer);
-    assert.ok(
-      connection.calls.some(
-        (call) => call.method === "Page.setInterceptFileChooserDialog" && call.params.cancel === true,
-      ),
+    await broker.handleCommand(
+      "office",
+      { type: "cancelFileSelection", requestId: cancelRequestId },
+      actor,
+      viewer,
     );
+    assert.ok(broker.portal.cancellations.includes(cancelRequestId));
     await broker.handleCommand(
       "office",
       { type: "pointer", event: "mousePressed", x: 20, y: 30, button: "left" },
       actor,
       viewer,
     );
-    connection.emit("event", {
-      method: "Page.fileChooserOpened",
-      sessionId: runtime.sessionId,
-      params: { backendNodeId: 90212, mode: "selectSingle" },
+    const closedRequestId = "44444444-4444-4444-8444-444444444444";
+    broker.portal.emit("open", {
+      requestId: closedRequestId,
+      workspaceId: "office",
+      multiple: false,
+      directory: false,
     });
-    runtime.fileChooser.openedAt = Date.now() - 3 * 60 * 1000;
-    await assert.rejects(
-      () => broker.handleCommand("office", command, actor, viewer),
-      /文件选择已过期/,
+    broker.portal.emit("closed", { requestId: closedRequestId, workspaceId: "office" });
+    assert.equal(runtime.fileChooser, null);
+    assert.equal(
+      viewer.messages.some(
+        (message) => message.type === "file-selection-cancelled" && message.requestId === closedRequestId,
+      ),
+      true,
     );
   } finally {
     broker.stop();

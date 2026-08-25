@@ -106,7 +106,7 @@ async function jsonRequest(base, path, { method = "GET", cookie, body, headers =
   return { response, body: await response.json() };
 }
 
-test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", async () => {
+test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自动恢复", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-api-"));
   const store = createStateStore({ file: join(directory, "state.json"), adminUser: "owner", adminPassword: "owner-password" });
   store.createWorkspace({ id: "office", name: "办公室", startUrl: "https://chatgpt.com/g/office" });
@@ -185,7 +185,12 @@ test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", asy
     });
     assert.equal(crossSite.response.status, 403);
 
-    const ws = new WebSocket(`ws://127.0.0.1:${address.port}/w/office/socket`, { headers: { cookie: officeCookie } });
+    const officeViewerId = "11111111-1111-4111-8111-111111111111";
+    const laboratoryViewerId = "22222222-2222-4222-8222-222222222222";
+    const ws = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/office/socket?viewer=${officeViewerId}&takeover=1`,
+      { headers: { cookie: officeCookie } },
+    );
     await new Promise((resolveOpen, reject) => {
       ws.once("open", resolveOpen);
       ws.once("error", reject);
@@ -203,7 +208,8 @@ test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", asy
     const officeReplaced = new Promise((resolveClose) => {
       ws.once("close", (code, reason) => resolveClose({ code, reason: reason.toString() }));
     });
-    const laboratorySocket = new WebSocket(`ws://127.0.0.1:${address.port}/w/laboratory/socket`, {
+    const laboratorySocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/laboratory/socket?viewer=${laboratoryViewerId}&takeover=1`, {
       headers: { cookie: laboratoryCookie },
     });
     await new Promise((resolveOpen, reject) => {
@@ -211,11 +217,24 @@ test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", asy
       laboratorySocket.once("error", reject);
     });
     assert.deepEqual(await officeReplaced, { code: 4000, reason: "replaced" });
+    assert.deepEqual(broker.viewers.map((viewer) => viewer.workspaceId), ["laboratory"]);
+
+    const staleReconnect = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/office/socket?viewer=${officeViewerId}&takeover=0`,
+      { headers: { cookie: officeCookie } },
+    );
+    const staleRejected = await new Promise((resolveClose, reject) => {
+      staleReconnect.once("close", (code, reason) => resolveClose({ code, reason: reason.toString() }));
+      staleReconnect.once("error", reject);
+    });
+    assert.deepEqual(staleRejected, { code: 4000, reason: "replaced" });
+    assert.equal(laboratorySocket.readyState, WebSocket.OPEN);
 
     const laboratoryReplaced = new Promise((resolveClose) => {
       laboratorySocket.once("close", (code, reason) => resolveClose({ code, reason: reason.toString() }));
     });
-    const activeSocket = new WebSocket(`ws://127.0.0.1:${address.port}/w/office/socket`, {
+    const activeSocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/office/socket?viewer=${officeViewerId}&takeover=1`, {
       headers: { cookie: officeCookie },
     });
     await new Promise((resolveOpen, reject) => {
@@ -223,10 +242,29 @@ test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", asy
       activeSocket.once("error", reject);
     });
     assert.deepEqual(await laboratoryReplaced, { code: 4000, reason: "replaced" });
+    assert.deepEqual(broker.viewers.map((viewer) => viewer.workspaceId), ["office"]);
     activeSocket.send(JSON.stringify({ type: "text", text: "LATEST_ONLY" }));
     await new Promise((resolveWait) => setTimeout(resolveWait, 30));
     assert.deepEqual(broker.commands[1], { workspaceId: "office", command: { type: "text", text: "LATEST_ONLY" } });
     assert.equal(broker.actors[1].username, "office-user");
+
+    const activeClosed = new Promise((resolveClose) => activeSocket.once("close", resolveClose));
+    activeSocket.close();
+    await activeClosed;
+    const recoveredSocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/office/socket?viewer=${officeViewerId}&takeover=0`,
+      { headers: { cookie: officeCookie } },
+    );
+    await new Promise((resolveOpen, reject) => {
+      recoveredSocket.once("open", resolveOpen);
+      recoveredSocket.once("error", reject);
+    });
+    recoveredSocket.send(JSON.stringify({ type: "text", text: "RECOVERED_ONLY" }));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+    assert.deepEqual(broker.commands[2], {
+      workspaceId: "office",
+      command: { type: "text", text: "RECOVERED_ONLY" },
+    });
 
     const adminLogin = await jsonRequest(base, "/admin/login", {
       method: "POST",
@@ -298,7 +336,7 @@ test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", asy
     const publicHealth = await jsonRequest(base, "/healthz");
     assert.equal(Object.hasOwn(publicHealth.body, "workspaceViewers"), false);
     assert.equal(Object.hasOwn(publicHealth.body.browser, "workspaceViewers"), false);
-    activeSocket.close();
+    recoveredSocket.close();
     const composerTools = await jsonRequest(base, "/admin/api/composer-tools", {
       method: "PATCH",
       cookie: adminCookie,
@@ -399,7 +437,8 @@ test("路径 Cookie 保持独立且同一用户的新连接接管旧窗口", asy
     assert.equal(created.response.status, 201);
     assert.equal(store.workspaces().length, 5);
 
-    const rejectedSocket = new WebSocket(`ws://127.0.0.1:${address.port}/w/office/socket`, {
+    const rejectedSocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/office/socket?viewer=33333333-3333-4333-8333-333333333333&takeover=1`, {
       headers: { cookie: officeCookie, origin: "https://attacker.example" },
     });
     const rejectedStatus = await new Promise((resolveRejected) => {

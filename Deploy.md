@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `gpt-pro-cloud-caddy` | 公共受信证书的 DNS-01 签发、续期与普通入口反代 | 内网 HTTPS `:443` |
 | `gpt-pro-cloud-gateway` | 管理、路径登录、敏感操作策略、文件传输、WebSocket 画面、输入与通知、管理员浏览器反代 | 本机管理 `:36090`；管理员浏览器默认仅回环 `:36091` |
-| `gpt-pro-cloud-desktop` | 一只 KasmVNC 桌面、一只 Chromium 进程、一份持久 Profile、任意数量独立顶层工作区窗口 | 无 |
+| `gpt-pro-cloud-desktop` | 一只 KasmVNC 桌面、一只 Chromium 进程、一份持久 Profile、任意数量独立顶层工作区窗口，以及标准 XDG FileChooser Portal 后端 | 无 |
 
 Caddy 是普通用户唯一入口。gateway 的明文端口默认仅绑定 `127.0.0.1`，desktop 的 KasmVNC `3000/3001`、Chromium CDP `9222/9223` 均不映射到宿主机；网关也不挂 Docker Socket。KasmVNC 的资源依赖原生根路径，因此同一 gateway 进程使用独立管理员监听转发，监听地址和管理页跳转均固定为 `http://127.0.0.1:36091/`。
 
@@ -21,6 +21,8 @@ Caddy 是普通用户唯一入口。gateway 的明文端口默认仅绑定 `127.
 | `./data-transfer/` | 与 Chromium Profile 分离的用户私人上传与远端下载文件 |
 
 三个数据根均被 `.gitignore` 排除。备份时要保护为敏感数据，不能上传到 Git、工单或公开日志。
+
+Compose 的 `portal-runtime` 卷只保存 desktop 与 gateway 之间的两个运行期 Unix socket。它不保存文件、会话或配置，启动时会重建，不属于备份范围。
 
 ## 首次启动
 
@@ -90,7 +92,7 @@ cp .env.example .env
 - macOS 本机的 `Command` 组合按远端 `Control` 语义发送，因此 `Command+A` 会执行远端全选；其它平台继续把本机 `Control` 发送为远端 `Control`。复制、剪切和粘贴仍留在本机浏览器。
 - 鼠标或键盘选区完成后，远端纯文本只映射到当前用户页面的隐藏文本框。`Cmd/Ctrl+C` 与 `Cmd/Ctrl+X` 由本机浏览器原生写入本机剪贴板；剪切再通过 Chromium 编辑命令作用于当前远端选区。该通道不广播选区，不程序化读取本机剪贴板，也不复制富文本、图片或文件格式。
 - ChatGPT 消息复制按钮保持可见。网关在按钮释放前监听远端 `clipboardchange`，按跨工作区全局顺序完成复制与读取，再把纯文本只交给触发操作的本机窗口；不轮询剪贴板，也不按时间推断归属。
-- 管理员浏览器直接强制启用 KasmVNC 官方 IME Input Mode；KasmVNC 自己监听本机组合事件并发送 Unicode，不再加载第二套项目输入法。当前真实事件序列与管理员通道以 Chromium 系浏览器为验收目标。
+- 管理员浏览器直接强制启用 KasmVNC 官方 IME Input Mode；KasmVNC 自己监听本机组合事件并发送 Unicode，不再加载第二套项目输入法。管理员本机粘贴使用浏览器当次 `paste` 事件的纯文本，先触发 KasmVNC Clipboard Up，再在同一 VNC WebSocket 上发送一次远端 `Ctrl+V`；不读取 Clipboard API，也不使用固定延时。当前真实事件序列与管理员通道以 Chromium 系浏览器为验收目标。
 - 输入桥接代码只处理最终文本和键盘路由，不读取或修改 `/config/chromium/`；容器重建仍由原有卷保留 ChatGPT 登录态。
 
 ## 普通页面通知
@@ -105,11 +107,13 @@ cp .env.example .env
 
 ## 文件传输
 
-普通工作区点击“上传文件”后，文件只流式写入 `data-transfer/uploads/<user-id>/`，不访问网页文件控件。要把文件交给 ChatGPT，用户必须先在 ChatGPT 页面手动点击上传；网关收到该次 `Page.fileChooserOpened` 后才显示当前用户的私人文件，用户勾选并点击“选择文件”后，网关只对该次选择器调用 `DOM.setFileInputFiles`。项目不主动查找 `<input type=file>`，也不保留等待下次选择器的自动注入任务。私人上传默认保留 24 小时，管理页或工作区文件面板也可提前删除。
+普通工作区点击“上传文件”后，文件只流式写入 `data-transfer/uploads/<user-id>/`，不访问网页文件控件。要把文件交给 ChatGPT，用户必须先在 ChatGPT 页面手动点击上传。Chromium 随后通过会话 D-Bus 调用标准 XDG Desktop Portal FileChooser，并携带触发窗口的 X11 XID；自定义 Portal 后端只接受带 `_GPC_WINDOW_KIND=workspace` 与有效 `_GPC_WORKSPACE_ID` 的 Chromium 顶层窗口，再通过运行期 Unix socket 把请求交给 gateway。网关消费该工作区近期输入所属的用户和普通窗口，只向这个窗口显示私人文件面板。用户确认后，gateway 解析其拥有的上传记录，Portal 再把受限的 `file://` URI 返回 Chromium，由 Chromium 自行创建网页标准 `FileList`。
+
+这条路径不启用 `Page.setInterceptFileChooserDialog`，不调用 `DOM.setFileInputFiles`，不查找网页 `<input type=file>`，也不使用 Linux 对话框坐标自动化。管理员顶层窗口带独立 `administrator` 标记，其 FileChooser 请求由同一后端转交 `xdg-desktop-portal-gtk`，所以完整管理员浏览器仍显示原生 GTK 文件选择器。无有效窗口标记、无近期所属用户输入、用户或工作区归属不一致、请求连接关闭时都取消当次选择，不保留等待下一次选择器的任务。私人上传默认保留 24 小时，管理页或工作区文件面板也可提前删除。
 
 Chromium 下载统一写入 `data-transfer/downloads/`。普通用户明确点击 ChatGPT 的 `Download` 或 `Download file` 后，网关会把网页的同源内容导航转换为带原文件名的 Chromium 下载；当前对话保持不变，普通页面的其它导航限制也不会放宽。网关优先让 CDP 按下载 GUID 命名；Chromium 的持久默认下载目录也固定到同一位置，因此其它 DevTools 会话重置该行为时，网关仍可依据完成事件报告的受限目录路径接管并改名，且不会读取 Profile 内的 `Downloads`。下载完成后，普通用户浏览器发送包含文件名和已保存到私人文件区的系统通知，未授权时改为右上角五秒页面提醒；下载失败时按相同方式显示文件名和网关返回的失败原因。由普通工作区触发的下载只出现在该工作区的“查看文件”面板；管理员可在管理页查看全部下载。由管理员浏览器触发且无法归属工作区的下载只对管理员可见。点击“保存到本机”后，由网关鉴权并以附件响应传给当前设备。
 
-`MAX_FILE_BYTES` 限制单个上传或下载，`TRANSFER_QUOTA_BYTES` 限制目录总量。超过限制的上传会在流式接收过程中终止；Chromium 下载会被取消并删除不完整文件。gateway 和 desktop 只共享 `data-transfer/`，gateway 不挂载 `data/browser/`。
+`MAX_FILE_BYTES` 限制单个上传或下载，`TRANSFER_QUOTA_BYTES` 限制目录总量。超过限制的上传会在流式接收过程中终止；Chromium 下载会被取消并删除不完整文件。gateway 和 desktop 只共享 `data-transfer/` 与不持久化的 Portal 运行期 socket，gateway 不挂载 `data/browser/`。
 
 ## 时区与语言
 
@@ -219,13 +223,13 @@ docker compose restart desktop
 
 1. `/healthz` 的 `connected` 为 `true`；
 2. `targets` 等于 `workspaces`；
-3. 各 `/w/<id>/` 路径会话仍归属原用户；
+3. 各 `/w/<id>/` 路径会话仍归属原用户；同一用户的新页面或“在此窗口继续”能立即接管，旧页面自动重连不能反向抢回所有权；
 4. 每个窗口能重新收到画面；
 5. 在一个窗口输入不会出现在其它窗口；
 6. 十二个工作区与管理员浏览器页共十三页读取到相同的时区、locale 和语言列表；
 7. 十二个工作区同时在线时 `captureMode` 为 `target-screencast`，`viewers` 与 `capturing` 均为 `12`，`frames` 持续增加且 `droppedFrames` 保持可接受；
 8. 普通工作区能从项目首页进入对话并通过常驻首页图标返回首页，右侧常驻刷新图标能刷新当前页面，折叠菜单不再重复显示刷新；项目、对话和单条消息的分享入口均不可见且输入前被拒绝；ChatGPT 消息复制按钮可把远端系统剪贴板定向复制到触发窗口；`@` / `+` 菜单只显示管理员按名称允许的功能，命中敏感按钮或 URL 时收到提示，管理员浏览器仍可完整操作；
-9. 本机上传只进入当前用户的私人目录；页面未手动打开文件选择器时不得调用 `DOM.setFileInputFiles`，确认后也只能选择该用户的文件；远端下载成功或失败时已授权浏览器发送系统通知，未授权时在右上角显示五秒页面提醒，文件只能由所属工作区或管理员取回。
+9. 本机上传只进入当前用户的私人目录；普通工作区手动打开文件选择器后，XDG Portal 请求必须携带该窗口的 X11 工作区标记并只显示近期输入所属用户的私人文件，确认后 Chromium 页面收到标准 `FileList`；源码与运行日志中不存在 CDP 文件选择拦截或 DOM 文件输入写入，管理员窗口仍出现 GTK 原生文件选择器；远端下载成功或失败时已授权浏览器发送系统通知，未授权时在右上角显示五秒页面提醒，文件只能由所属工作区或管理员取回。
 10. 管理员浏览器已允许 `chatgpt.com` 通知，真实 ChatGPT 完成通知的标题正文只转发到所属工作区的普通页面；该页面已授权时发送系统通知，未授权时显示右上角五秒页面提醒，其它工作区不收到。
 
 Chromium Target ID 和 CDP sessionId 只存在内存，不写入状态文件；重启后发生变化是正确行为。

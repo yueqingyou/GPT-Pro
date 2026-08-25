@@ -963,9 +963,12 @@ function pressedPointerButton(buttons) {
 function renderViewer(workspace, fileTransfer = { enabled: false }) {
   document.title = workspace.name;
   const macOS = navigator.platform === "MacIntel";
+  const viewerId = globalThis.crypto.randomUUID();
   let socket;
   let intentionalClose = false;
   let reconnects = 0;
+  let reconnectTimer = null;
+  let takeover = true;
   let viewport = { width: 1440, height: 900 };
   let drawingFrame = false;
   let pendingFrame = null;
@@ -973,7 +976,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   let menuToggle;
   let transferPanel;
   let confirmSelection;
-  let fileSelection = { active: false, mode: "selectSingle" };
+  let fileSelection = { active: false, mode: "selectSingle", requestId: "" };
   const selectedUploadIds = new Set();
   let pointerSequence = 0;
   let pointerDown = false;
@@ -1071,6 +1074,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
 
   const showReplacedPage = () => {
     intentionalClose = true;
+    clearTimeout(reconnectTimer);
     clearTimeout(noticeTimer);
     document.removeEventListener("visibilitychange", sendViewerState);
     nativeInput.blur();
@@ -1135,17 +1139,24 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   };
 
   const connect = () => {
+    clearTimeout(reconnectTimer);
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    socket = new WebSocket(`${protocol}//${location.host}/w/${workspace.id}/socket`);
-    socket.binaryType = "blob";
-    socket.addEventListener("open", () => {
+    const currentSocket = new WebSocket(
+      `${protocol}//${location.host}/w/${workspace.id}/socket?viewer=${viewerId}&takeover=${takeover ? "1" : "0"}`,
+    );
+    takeover = false;
+    socket = currentSocket;
+    currentSocket.binaryType = "blob";
+    currentSocket.addEventListener("open", () => {
+      if (socket !== currentSocket) return;
       reconnects = 0;
       setStatus("已连接", "online");
       const rect = stage.getBoundingClientRect();
       send({ type: "resize", width: Math.round(rect.width), height: Math.round(rect.height) });
       sendViewerState();
     });
-    socket.addEventListener("message", async (event) => {
+    currentSocket.addEventListener("message", async (event) => {
+      if (socket !== currentSocket) return;
       if (typeof event.data === "string") {
         const payload = JSON.parse(event.data);
         if (payload.type === "viewport") {
@@ -1164,16 +1175,26 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
           fileSelection = {
             active: true,
             mode: payload.mode === "selectMultiple" ? "selectMultiple" : "selectSingle",
+            requestId: String(payload.requestId || ""),
           };
           selectedUploadIds.clear();
           setStatus("请选择私人文件");
           openTransferPanel(true).catch((error) => setStatus(error.message, "error"));
         } else if (payload.type === "files-selected") {
+          if (payload.requestId !== fileSelection.requestId) return;
           fileSelection.active = false;
+          fileSelection.requestId = "";
           selectedUploadIds.clear();
           transferPanel.hidden = true;
           setStatus(`已选择：${payload.files.map((file) => file.name).join("、")}`, "online");
           if (pointerEditable === true) nativeInput.focus();
+        } else if (payload.type === "file-selection-cancelled") {
+          if (payload.requestId !== fileSelection.requestId) return;
+          fileSelection.active = false;
+          fileSelection.requestId = "";
+          selectedUploadIds.clear();
+          transferPanel.hidden = true;
+          setStatus("文件选择已取消");
         } else if (payload.type === "download") {
           refreshTransfers().catch((error) => setStatus(error.message, "error"));
           if (payload.file.state === "ready") {
@@ -1198,7 +1219,8 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       }
       drawNewestFrame(event.data);
     });
-    socket.addEventListener("close", async (event) => {
+    currentSocket.addEventListener("close", async (event) => {
+      if (socket !== currentSocket) return;
       if (event.code === VIEWER_REPLACED_CLOSE_CODE) {
         showReplacedPage();
         return;
@@ -1217,9 +1239,9 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
           setStatus(`连接中断，状态检查失败：${error.message}`, "error");
         }
       }
-      setTimeout(connect, Math.min(5000, 700 * reconnects));
+      reconnectTimer = setTimeout(connect, Math.min(5000, 700 * reconnects));
     });
-    socket.addEventListener("error", () => socket.close());
+    currentSocket.addEventListener("error", () => currentSocket.close());
   };
 
   document.addEventListener("visibilitychange", sendViewerState);
@@ -1360,7 +1382,11 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     onClick: () => {
       if (!selectedUploadIds.size) return;
       confirmSelection.disabled = true;
-      if (!send({ type: "selectFiles", uploadIds: [...selectedUploadIds] })) {
+      if (!send({
+        type: "selectFiles",
+        requestId: fileSelection.requestId,
+        uploadIds: [...selectedUploadIds],
+      })) {
         confirmSelection.disabled = false;
         setStatus("工作区连接尚未恢复", "error");
       }
@@ -1369,9 +1395,11 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   const closeTransferPanel = () => {
     transferPanel.hidden = true;
     if (fileSelection.active) {
+      const requestId = fileSelection.requestId;
       fileSelection.active = false;
+      fileSelection.requestId = "";
       selectedUploadIds.clear();
-      send({ type: "cancelFileSelection" });
+      send({ type: "cancelFileSelection", requestId });
       setStatus("文件选择已取消");
     }
     if (pointerEditable === true) nativeInput.focus();
@@ -1469,7 +1497,11 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
 
   async function openTransferPanel(selecting = false) {
     if (!selecting) {
+      if (fileSelection.active) {
+        send({ type: "cancelFileSelection", requestId: fileSelection.requestId });
+      }
       fileSelection.active = false;
+      fileSelection.requestId = "";
       selectedUploadIds.clear();
     }
     controlPanel.hidden = true;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { installAdministratorPaste } from "../gateway/web/admin-browser.js";
 import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "../gateway/web/text-input.js";
 
 class FakeInput extends EventTarget {
@@ -56,6 +57,64 @@ test("英文、中文、表情与粘贴文本直接提交本机浏览器输出",
     { text: "🙂中文\n第二行", options: { paste: true } },
   ]);
   assert.equal(input.value, "");
+});
+
+test("普通工作区粘贴会覆盖旧选区并且只提交当次剪贴板文本", () => {
+  const input = new FakeInput();
+  const committed = [];
+  const nativeInput = attachNativeTextInput({ input, commitText: (text, options) => committed.push({ text, options }) });
+  nativeInput.setSelectionText("上一次复制的内容");
+
+  input.value = "当次本机剪贴板内容";
+  emit(input, "input", { inputType: "insertFromPaste", data: null, isComposing: false });
+
+  assert.deepEqual(committed, [
+    { text: "当次本机剪贴板内容", options: { paste: true } },
+  ]);
+  assert.equal(input.value, "");
+});
+
+test("管理员粘贴先同步当次剪贴板再发送一次远端 Ctrl+V", () => {
+  class FakeKeyboardEvent extends Event {
+    constructor(type, values = {}) {
+      super(type, { bubbles: values.bubbles });
+      for (const [key, value] of Object.entries(values)) {
+        if (key !== "bubbles") Object.defineProperty(this, key, { value });
+      }
+    }
+  }
+  const keyboardInput = new EventTarget();
+  const clipboardInput = new EventTarget();
+  clipboardInput.value = "旧的远程剪贴板";
+  const document = {
+    querySelector(selector) {
+      return selector === "#noVNC_keyboardinput" ? keyboardInput : clipboardInput;
+    },
+  };
+  const sequence = [];
+  clipboardInput.addEventListener("change", () => sequence.push(`clipboard:${clipboardInput.value}`));
+  installAdministratorPaste(document, Event, FakeKeyboardEvent);
+  keyboardInput.addEventListener("keydown", (event) => sequence.push(`down:${event.code}`));
+  keyboardInput.addEventListener("keyup", (event) => sequence.push(`up:${event.code}`));
+
+  const shortcut = new FakeKeyboardEvent("keydown", { key: "v", code: "KeyV", metaKey: true });
+  keyboardInput.dispatchEvent(shortcut);
+  assert.deepEqual(sequence, []);
+
+  const paste = new Event("paste", { cancelable: true });
+  Object.defineProperty(paste, "clipboardData", {
+    value: { getData: (type) => type === "text/plain" ? "当次本机剪贴板" : "" },
+  });
+  keyboardInput.dispatchEvent(paste);
+
+  assert.equal(paste.defaultPrevented, true);
+  assert.deepEqual(sequence, [
+    "clipboard:当次本机剪贴板",
+    "down:ControlLeft",
+    "down:KeyV",
+    "up:KeyV",
+    "up:ControlLeft",
+  ]);
 });
 
 test("远端选区映射到本机隐藏输入框供原生复制与剪切", () => {
