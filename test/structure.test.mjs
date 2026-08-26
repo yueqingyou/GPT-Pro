@@ -12,6 +12,7 @@ test("Compose 只保留一个桌面 Profile 且不挂 Docker Socket", () => {
   assert.match(compose, /PROFILE_AUTO_DETECT:/);
   assert.match(compose, /PROFILE_GEO_ENDPOINT:/);
   assert.match(compose, /FRAME_ACTIVE_FPS:/);
+  assert.match(compose, /user: "\$\{PUID:-1000\}:\$\{PGID:-1000\}"/);
   assert.match(compose, /- "127\.0\.0\.1:\$\{MAINTENANCE_PORT:-36091\}:8081"/);
   assert.doesNotMatch(compose, /MAINTENANCE_(?:BIND_ADDR|PUBLIC_URL|PUBLIC_PORT)/);
   assert.doesNotMatch(compose, /^\s+FRAME_FPS:/m);
@@ -33,10 +34,13 @@ test("普通入口使用 DNSPod DNS-01 的单一 HTTPS 反向代理", () => {
   const caddyfile = read("caddy/Caddyfile");
   const dockerfile = read("caddy/Dockerfile");
   assert.match(compose, /^  https:\n/m);
-  assert.match(compose, /- "443:443"/);
+  assert.match(compose, /- "0\.0\.0\.0:\$\{HTTPS_PORT:-443\}:443"/);
   assert.match(compose, /\$\{BIND_ADDR:-127\.0\.0\.1\}:\$\{HTTP_PORT:-36090\}:8080/);
   assert.match(compose, /TENCENTCLOUD_SECRET_ID: \$\{TENCENTCLOUD_SECRET_ID\?/);
   assert.match(compose, /TENCENTCLOUD_SECRET_KEY: \$\{TENCENTCLOUD_SECRET_KEY\?/);
+  assert.match(compose, /HTTPS_PROXY: \$\{CADDY_PROXY_URL:-\}/);
+  assert.match(compose, /NO_PROXY: gateway,localhost,127\.0\.0\.1/);
+  assert.match(compose, /host\.docker\.internal:host-gateway/);
   assert.match(caddyfile, /dns tencentcloud/);
   assert.match(caddyfile, /reverse_proxy gateway:8080/);
   assert.match(caddyfile, /auto_https disable_redirects/);
@@ -65,6 +69,7 @@ test("启动脚本只在容器健康后打印入口", () => {
   assert.match(script, /docker compose up -d --build --wait/);
   assert.match(script, /TENCENTCLOUD_SECRET_ID:\?/);
   assert.match(script, /TENCENTCLOUD_SECRET_KEY:\?/);
+  assert.match(script, /HTTPS_PORT:-443/);
   assert.ok(script.indexOf("--wait") < script.indexOf('echo "普通入口：'));
 });
 

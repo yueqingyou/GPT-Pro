@@ -4,13 +4,13 @@
 
 | 容器 | 作用 | 对宿主机发布 |
 | --- | --- | --- |
-| `gpt-pro-cloud-caddy` | 公共受信证书的 DNS-01 签发、续期与普通入口反代 | 内网 HTTPS `:443` |
+| `gpt-pro-cloud-caddy` | 公共受信证书的 DNS-01 签发、续期与普通入口反代 | 显式 IPv4 HTTPS 端口，默认 `:443` |
 | `gpt-pro-cloud-gateway` | 管理、路径登录、敏感操作策略、文件传输、WebSocket 画面、输入与通知、管理员浏览器反代 | 本机管理 `:36090`；管理员浏览器默认仅回环 `:36091` |
 | `gpt-pro-cloud-desktop` | 一只 KasmVNC 桌面、一只 Chromium 进程、一份持久 Profile、任意数量独立顶层工作区窗口，以及标准 XDG FileChooser Portal 后端 | 无 |
 
 Caddy 是普通用户唯一入口。gateway 的明文端口默认仅绑定 `127.0.0.1`，desktop 的 KasmVNC `3000/3001`、Chromium CDP `9222/9223` 均不映射到宿主机；网关也不挂 Docker Socket。KasmVNC 的资源依赖原生根路径，因此同一 gateway 进程使用独立管理员监听转发，监听地址和管理页跳转均固定为 `http://127.0.0.1:36091/`。
 
-desktop 安装与 Chromium 完全同版本的 Debian setuid sandbox，并且是唯一增加 `SYS_ADMIN` 的服务；该 capability 只供 sandbox helper 创建 renderer 的 PID 与网络命名空间。Chromium 仍按 `PUID`、`PGID` 运行且 browser 与 renderer 都没有有效 capability。Compose 不使用 `privileged`、`--no-sandbox` 或 `seccomp=unconfined`；gateway 与 Caddy 不继承 `SYS_ADMIN`。
+desktop 安装与 Chromium 完全同版本的 Debian setuid sandbox，并且是唯一增加 `SYS_ADMIN` 的服务；该 capability 只供 sandbox helper 创建 renderer 的 PID 与网络命名空间。Chromium 仍按 `PUID`、`PGID` 运行且 browser 与 renderer 都没有有效 capability。gateway 直接按同一 `PUID`、`PGID` 运行。Compose 不使用 `privileged`、`--no-sandbox` 或 `seccomp=unconfined`；gateway 与 Caddy 不继承 `SYS_ADMIN`。
 
 持久数据：
 
@@ -30,7 +30,7 @@ Compose 的 `portal-runtime` 卷只保存 desktop 与 gateway 之间的两个运
 
 ```bash
 cp .env.example .env
-# 填写 DNSPod 专用 CAM 子用户的 SecretId、SecretKey，再按需修改其它部署值
+# 替换 PUBLIC_HOST，并填写 DNSPod 专用 CAM 子用户的 SecretId、SecretKey
 ./scripts/up.sh
 ```
 
@@ -45,21 +45,22 @@ cp .env.example .env
 5. 创建本地用户和密码，为其勾选允许访问的工作区。管理员自动拥有全部工作区。
 6. 登录 `/admin/` 后，在系统功能区点击“打开管理员浏览器”；管理页会用三十秒内单次消费的随机凭据把当前管理员登录态交接到 `127.0.0.1:36091`，无需再次登录网关。在里面登录唯一的 ChatGPT Pro 账号、完成 MFA，并允许 `chatgpt.com` 发送通知。退出 ChatGPT、修改全局账号设置和安装 Chrome 扩展也只在这里进行。
 7. 打开每个工作区窗口并刷新。每个工作区对应独立顶层 Chromium 窗口，但共用刚才建立的 ChatGPT Cookie。
-8. 在办公室、实验室、家里等客户端分别收藏 `https://pro.lyhbio.cn/w/<id>/`；每条路径可使用不同的网关用户名与密码。任务完成提醒会直接显示在当前连接的普通页面中。
+8. 在办公室、实验室、家里等客户端分别收藏 `https://gpt-pro.example.com/w/<id>/`；每条路径可使用不同的网关用户名与密码。任务完成提醒会直接显示在当前连接的普通页面中。
 
 ## 内网 HTTPS
 
-- DNSPod 的 `pro.lyhbio.cn` A 记录指向部署主机私网地址 `10.16.30.152`，TTL 为 600；它不把服务暴露到公网，公网访问者也无法路由到该私网地址。
-- Caddy 使用 DNS-01 临时创建 `_acme-challenge.pro.lyhbio.cn` TXT 记录，签发后删除；证书数据保存在 `caddy-data` 卷中并由 Caddy 自动续期。DNS-01 不要求公网能连接部署主机。
+- 以下使用 `gpt-pro.example.com` 和 `10.0.0.10` 作为文档占位符，部署时必须替换为自有域名和主机实际私网地址。
+- DNSPod 的 `gpt-pro.example.com` A 记录指向部署主机私网地址，例如 `10.0.0.10`，TTL 为 600；它不把服务暴露到公网，公网访问者也无法路由到该私网地址。
+- Caddy 使用 DNS-01 临时创建 `_acme-challenge.gpt-pro.example.com` TXT 记录，签发后删除；证书数据保存在 `caddy-data` 卷中并由 Caddy 自动续期。DNS-01 不要求公网能连接部署主机。
 - 专用 CAM 子用户只授予 `dnspod:DescribeRecordList`、`dnspod:CreateRecord` 和 `dnspod:DeleteRecord`，不得绑定 DNSPod 全读写或其它腾讯云权限。SecretId 与 SecretKey 只写入被 Git 和 Docker 构建上下文排除的 `.env`。
-- `BIND_ADDR=127.0.0.1` 保证普通用户不能绕过 Caddy 访问明文网关。校园网若启用了客户端隔离或阻断 TCP 443，需要由网络管理员放通该主机的内网 443 入站，而不是另加应用 fallback。
-- 部署主机地址变化时更新 `pro` 记录并为主机配置 DHCP 保留地址；普通用户书签不变。
+- `BIND_ADDR=127.0.0.1` 保证普通用户不能绕过 Caddy 访问明文网关。`HTTPS_PORT` 只控制 Caddy 显式发布的宿主机 IPv4 端口，不发布 IPv6。网络若阻断所选端口，需要由网络管理员放通，而不是另加应用 fallback。
+- 部署主机地址变化时更新对应 A 记录并为主机配置 DHCP 保留地址；普通用户书签不变。
 
 普通工作区不需要暴露管理员浏览器端口。管理员登录、MFA、扩展管理与恢复默认只在部署主机完成；不要把 `:36091` 直接发布给普通用户。
 
 ## 代理
 
-`PROXY_URL` 是整个 Chromium 进程的全局代理。宿主机上的 `127.0.0.1`、`localhost` 与 `[::1]` 会改写为 `host.docker.internal`。
+`PROXY_URL` 是整个 Chromium 进程的全局代理。宿主机上的 `127.0.0.1`、`localhost` 与 `[::1]` 会改写为 `host.docker.internal`。`CADDY_PROXY_URL` 是 Caddy 独立使用的可选 HTTP 代理，必须填写容器可达地址；留空时 Caddy 直连。两者不会互相 fallback。
 
 所有工作区共享一只 Chromium 进程和网络服务，因此不能让不同 Target 使用不同代理出口。需要多出口时必须运行多份完整部署；那也意味着多份 Profile 和分别登录，不属于本项目的单登录目标。
 
@@ -101,9 +102,9 @@ cp .env.example .env
 
 管理员先在完整管理员浏览器中允许 `chatgpt.com` 发送通知；这是共享 Chromium Profile 的全局权限，普通用户页面不会修改。受管 ChatGPT Page Target 实际调用原生 `Notification` 构造器后，网关只把标题和正文实时发给该 Target 所属工作区的当前连接页面，不判断普通对话、Deep Research 或其它任务类型，也不扫描完成状态。
 
-普通页面收到网关消息后，若 `https://pro.lyhbio.cn` 已获普通用户浏览器的网页通知权限，则直接发送系统通知；否则在右上角显示五秒后自动关闭的页面提醒，并在此期间标记标签页标题。用户首次点击普通页面时立即打开浏览器原生授权弹窗；页面加载时不申请，因为浏览器要求权限请求由用户手势触发。提醒不操作远端 ChatGPT、不改变 URL，也不发送输入。
+普通页面收到网关消息后，若配置的 HTTPS origin 已获普通用户浏览器的网页通知权限，则直接发送系统通知；否则在右上角显示五秒后自动关闭的页面提醒，并在此期间标记标签页标题。用户首次点击普通页面时立即打开浏览器原生授权弹窗；页面加载时不申请，因为浏览器要求权限请求由用户手势触发。提醒不操作远端 ChatGPT、不改变 URL，也不发送输入。
 
-该入口由 Caddy 使用 DNSPod DNS-01 自动签发和续期公共受信证书；普通客户端无需安装证书、策略、扩展或隧道。DNS-01 只要求公网权威 DNS 短暂提供 `_acme-challenge.pro.lyhbio.cn` TXT 记录，不要求公网能连接部署主机。实现依据见 [Caddy DNS challenge](https://caddyserver.com/docs/automatic-https#dns-challenge) 与 [Tencent Cloud DNS Caddy 模块](https://github.com/caddy-dns/tencentcloud)。
+该入口由 Caddy 使用 DNSPod DNS-01 自动签发和续期公共受信证书；普通客户端无需安装证书、策略、扩展或隧道。DNS-01 只要求公网权威 DNS 短暂提供对应 `_acme-challenge` TXT 记录，不要求公网能连接部署主机。实现依据见 [Caddy DNS challenge](https://caddyserver.com/docs/automatic-https#dns-challenge) 与 [Tencent Cloud DNS Caddy 模块](https://github.com/caddy-dns/tencentcloud)。
 
 通知仅在普通页面仍打开且 WebSocket 保持连接时转发。页面关闭、退出登录、浏览器退出或设备离线后不补发；项目不注册本地 Service Worker，不保存通知内容，也不建立 Push 订阅或离线队列。
 

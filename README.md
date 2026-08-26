@@ -55,11 +55,11 @@ Requirements: Docker with Compose v2. Docker Desktop works on macOS and Windows;
 git clone https://github.com/yueqingyou/GPT-Pro-Cloud.git
 cd GPT-Pro-Cloud
 cp .env.example .env
-# Fill in the dedicated DNSPod CAM user's SecretId and SecretKey in .env
+# Replace PUBLIC_HOST and fill in the dedicated DNSPod CAM credentials in .env
 ./scripts/up.sh
 ```
 
-On the deployment host, open `http://127.0.0.1:36090/admin/`. Ordinary users only visit `https://pro.lyhbio.cn/w/<id>/`.
+On the deployment host, open `http://127.0.0.1:36090/admin/`. Ordinary users only visit the configured `https://gpt-pro.example.com/w/<id>/` entry.
 
 1. Create the administrator, unless `AUTH_PASSWORD` pre-created it.
 2. Review **Browser environment**. On first start it detects timezone and language through Chromium's actual egress; the administrator can replace an unsuitable result.
@@ -91,13 +91,15 @@ The commented [`.env.example`](.env.example) is authoritative.
 | Variable | Purpose |
 | --- | --- |
 | `AUTH_USER` / `AUTH_PASSWORD` | Optionally pre-create the administrator. Leave the password empty for the first-visit setup page |
-| `PUBLIC_HOST` | Ordinary-user HTTPS host; this deployment uses `pro.lyhbio.cn` |
+| `PUBLIC_HOST` | Ordinary-user HTTPS host, such as `gpt-pro.example.com` |
+| `HTTPS_PORT` | Explicit IPv4 host port for the ordinary HTTPS entry; default `443` |
 | `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` | Dedicated CAM user credentials restricted to reading, creating and deleting DNSPod challenge records |
 | `BIND_ADDR` / `HTTP_PORT` | Local gateway administration and health-check entry; loopback by default |
 | `MAINTENANCE_PORT` | Administrator-only full Chromium browser port; its listener and management-page redirect are fixed to `127.0.0.1` |
-| `PUID` / `PGID` / `TZ` | Desktop file ownership and bootstrap timezone; `TZ` is also the deployment value used after a detection failure |
+| `PUID` / `PGID` / `TZ` | Desktop and gateway file ownership plus bootstrap timezone; `TZ` is also the deployment value used after a detection failure |
 | `START_URL` | Initial page shown in the administrator browser |
 | `PROXY_URL` | One global Chromium proxy; loopback hostnames are rewritten for Docker |
+| `CADDY_PROXY_URL` | Optional container-reachable HTTP proxy used only by Caddy; empty means direct access |
 | `PROFILE_AUTO_DETECT` | Detect the environment through Chromium on the first unconfigured start; default `true` |
 | `PROFILE_GEO_ENDPOINT` / `PROFILE_GEO_TIMEOUT_MS` | CORS-enabled HTTPS endpoint returning timezone plus languages or a country code, and its timeout; defaults to `https://ipwho.is/?fields=success,country_code,timezone.id` / `5000` |
 | `PROFILE_TIMEZONE` / `PROFILE_LOCALE` | Optional deployment values used when automatic detection fails or is disabled |
@@ -150,7 +152,7 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 
 ## Security boundary
 
-- Caddy publishes the ordinary HTTPS entry on `:443` to the LAN. Gateway `:36090` and administrator-browser `:36091` bind to loopback by default. Opening the administrator browser consumes a 30-second one-time handoff and reuses the authenticated administrator session on `127.0.0.1`; DNS, Caddy and a parent-domain Cookie are deliberately not used to widen this local boundary. The desktop container itself, Chromium DevTools and raw KasmVNC ports remain private.
+- Caddy publishes the ordinary HTTPS entry on the configured explicit IPv4 host port. Gateway `:36090` and administrator-browser `:36091` bind to loopback by default. Opening the administrator browser consumes a 30-second one-time handoff and reuses the authenticated administrator session on `127.0.0.1`; DNS, Caddy and a parent-domain Cookie are deliberately not used to widen this local boundary. The desktop container itself, Chromium DevTools and raw KasmVNC ports remain private.
 - The desktop image installs Debian's exact-version Chromium setuid sandbox and is the only service granted `SYS_ADMIN` so that helper can create the renderer PID and network namespaces. Chromium still runs as `PUID`/`PGID` without effective capabilities; the deployment does not use `privileged`, `--no-sandbox` or an unconfined container seccomp profile.
 - The gateway no longer mounts `/var/run/docker.sock`.
 - Passwords use per-user salted scrypt hashes. Session and state files are created with private permissions.
@@ -162,7 +164,7 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 - Private uploads are visible only to their owner. Staging a local file never touches a page file input. Only an XDG Portal request carrying a valid tagged workspace window and a recent input owner can open that one workbench confirmation; the gateway returns only the confirmed owner's paths and Chromium constructs the native file list. Downloads are visible only to the owning workspace or the administrator. File names, per-file size and total capacity are constrained.
 - Mutating HTTP requests and WebSocket upgrades reject cross-origin browser requests.
 - Corrupt state, session or transfer-index JSON causes startup to fail closed instead of silently resetting access control.
-- Ordinary users must not bypass `https://pro.lyhbio.cn` to reach the cleartext gateway. Public DNS publishes only the deployment host's private address for `pro.lyhbio.cn`; no public inbound port is opened.
+- Ordinary users must not bypass the configured HTTPS origin to reach the cleartext gateway. Public DNS publishes only the deployment host's private address; no public inbound port is opened.
 - Finish administrator setup on a trusted network before exposing the gateway. While no administrator exists, the first visitor can claim setup.
 
 ## Resource behavior

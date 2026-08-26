@@ -55,11 +55,11 @@ GPT Pro 在你控制的机器上运行一份持久化 Chromium Profile。你只�
 git clone https://github.com/yueqingyou/GPT-Pro-Cloud.git
 cd GPT-Pro-Cloud
 cp .env.example .env
-# 在 .env 中填写 DNSPod 专用子用户的 SecretId 与 SecretKey
+# 在 .env 中替换 PUBLIC_HOST，并填写 DNSPod 专用子用户凭据
 ./scripts/up.sh
 ```
 
-管理员在部署主机打开 `http://127.0.0.1:36090/admin/`；普通用户只访问 `https://pro.lyhbio.cn/w/<id>/`：
+管理员在部署主机打开 `http://127.0.0.1:36090/admin/`；普通用户只访问配置的 `https://gpt-pro.example.com/w/<id>/` 入口：
 
 1. 创建管理员；若已通过 `AUTH_PASSWORD` 预设，则直接登录。
 2. 核对“浏览器环境”。首次启动会按 Chromium 实际出口自动探测时区与语言；结果不合适时由管理员手动改写。
@@ -91,13 +91,15 @@ cp .env.example .env
 | 变量 | 作用 |
 | --- | --- |
 | `AUTH_USER` / `AUTH_PASSWORD` | 可选预建管理员；密码留空则使用首次访问向导 |
-| `PUBLIC_HOST` | 普通用户 HTTPS 域名，当前部署为 `pro.lyhbio.cn` |
+| `PUBLIC_HOST` | 普通用户 HTTPS 域名，例如 `gpt-pro.example.com` |
+| `HTTPS_PORT` | 普通 HTTPS 入口显式发布的宿主机 IPv4 端口，默认 `443` |
 | `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` | 仅允许 DNSPod 查询、创建和删除验证记录的专用 CAM 子用户凭据 |
 | `BIND_ADDR` / `HTTP_PORT` | 本机网关管理与健康检查入口，默认仅回环 |
 | `MAINTENANCE_PORT` | 仅管理员使用的完整 Chromium 浏览器端口；监听地址和管理页跳转固定为 `127.0.0.1` |
-| `PUID` / `PGID` / `TZ` | 桌面数据属主与容器启动时区；`TZ` 也是自动探测失败后使用的部署值 |
+| `PUID` / `PGID` / `TZ` | desktop 与 gateway 数据属主及容器启动时区；`TZ` 也是自动探测失败后使用的部署值 |
 | `START_URL` | 管理员浏览器的初始页面 |
 | `PROXY_URL` | Chromium 全局代理；宿主机回环地址会为 Docker 改写 |
+| `CADDY_PROXY_URL` | 仅供 Caddy 使用的可选容器可达 HTTP 代理；留空则直连 |
 | `PROFILE_AUTO_DETECT` | 首次启动时是否按 Chromium 实际出口探测环境，默认 `true` |
 | `PROFILE_GEO_ENDPOINT` / `PROFILE_GEO_TIMEOUT_MS` | 允许浏览器 CORS 且返回时区与语言或国家代码的 HTTPS 端点与超时，默认 `https://ipwho.is/?fields=success,country_code,timezone.id` / `5000` |
 | `PROFILE_TIMEZONE` / `PROFILE_LOCALE` | 自动探测失败或被禁用时使用的可选部署值 |
@@ -150,7 +152,7 @@ IP 归属地提供的语言只是地区默认推断，不一定等于操作者�
 
 ## 安全边界
 
-- Caddy 只向内网发布普通 HTTPS 入口 `:443`；gateway 的 `:36090` 和管理员浏览器的 `:36091` 默认仅绑定回环。打开管理员浏览器时会消费一个三十秒有效的一次性交接凭据，在 `127.0.0.1` 复用已认证的管理员会话；不通过 DNS、Caddy 或父域 Cookie 扩大这个本机边界。desktop 容器、Chromium DevTools 与原始 KasmVNC 端口仍只在私有网络内。
+- Caddy 只在显式配置的宿主机 IPv4 端口发布普通 HTTPS 入口；gateway 的 `:36090` 和管理员浏览器的 `:36091` 默认仅绑定回环。打开管理员浏览器时会消费一个三十秒有效的一次性交接凭据，在 `127.0.0.1` 复用已认证的管理员会话；不通过 DNS、Caddy 或父域 Cookie 扩大这个本机边界。desktop 容器、Chromium DevTools 与原始 KasmVNC 端口仍只在私有网络内。
 - desktop 镜像安装与 Chromium 完全同版本的 Debian setuid sandbox，并且只有该服务增加 `SYS_ADMIN`，供 helper 创建 renderer 的 PID 与网络命名空间。Chromium 仍按 `PUID` / `PGID` 运行且没有有效 capability；部署不使用 `privileged`、`--no-sandbox` 或不受限的容器 seccomp profile。
 - 网关不再挂载 `/var/run/docker.sock`。
 - 密码使用逐用户随机盐的 scrypt 摘要；状态和会话文件以当前用户私有权限创建。
@@ -162,7 +164,7 @@ IP 归属地提供的语言只是地区默认推断，不一定等于操作者�
 - 私人上传只对所属用户可见；本机暂存不触发网页文件控件，只有带有效工作区窗口标记和近期所属用户输入的 XDG Portal 请求才能打开当次工作台确认。网关只返回该用户已确认的私人路径，文件列表由 Chromium 原生建立。下载只允许所属工作区或管理员取回。文件名、单文件和总容量均受约束。
 - 有副作用的 HTTP 请求与 WebSocket 升级会拒绝跨站 Origin。
 - 状态、会话或文件传输索引 JSON 损坏时失败关闭，不会静默重置权限数据。
-- 普通用户不得绕过 `https://pro.lyhbio.cn` 直接访问明文网关；`pro.lyhbio.cn` 的公网 DNS 只发布部署主机私网 IP，不开放公网入站端口。
+- 普通用户不得绕过配置的 HTTPS origin 直接访问明文网关；公网 DNS 只发布部署主机私网 IP，不开放公网入站端口。
 - 对外开放前先在可信网络完成管理员初始化；尚无管理员时，首位访问者可以认领初始化。
 
 ## 容量与资源

@@ -9,12 +9,17 @@ services:
       PUBLIC_HOST: ${PUBLIC_HOST?请在 .env 中设置 PUBLIC_HOST}
       TENCENTCLOUD_SECRET_ID: ${TENCENTCLOUD_SECRET_ID?请在 .env 中设置 TENCENTCLOUD_SECRET_ID}
       TENCENTCLOUD_SECRET_KEY: ${TENCENTCLOUD_SECRET_KEY?请在 .env 中设置 TENCENTCLOUD_SECRET_KEY}
+      HTTP_PROXY: ${CADDY_PROXY_URL:-}
+      HTTPS_PROXY: ${CADDY_PROXY_URL:-}
+      NO_PROXY: gateway,localhost,127.0.0.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     ports:
-      - "443:443"
+      - "0.0.0.0:${HTTPS_PORT:-443}:443"
     depends_on:
       gateway:
         condition: service_healthy
@@ -31,6 +36,7 @@ services:
       dockerfile: gateway/Dockerfile
     image: gpt-pro-cloud-gateway:local
     container_name: gpt-pro-cloud-gateway
+    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       PORT: "8080"
       AUTH_USER: ${AUTH_USER:-admin}

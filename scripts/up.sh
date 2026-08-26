@@ -17,7 +17,11 @@ DISPLAY_ADDR="${BIND_ADDR:-127.0.0.1}"
 if [ "$DISPLAY_ADDR" = "0.0.0.0" ] || [ "$DISPLAY_ADDR" = "::" ]; then
   DISPLAY_ADDR=127.0.0.1
 fi
-echo "普通入口：https://${PUBLIC_HOST}"
+PUBLIC_URL="https://${PUBLIC_HOST}"
+if [ "${HTTPS_PORT:-443}" != 443 ]; then
+  PUBLIC_URL="${PUBLIC_URL}:${HTTPS_PORT}"
+fi
+echo "普通入口：${PUBLIC_URL}"
 echo "管理：http://${DISPLAY_ADDR}:${HTTP_PORT:-36090}/admin/"
 echo "管理员浏览器：http://127.0.0.1:${MAINTENANCE_PORT:-36091}（需先登录管理页）"
 if [ -z "${AUTH_PASSWORD:-}" ]; then
