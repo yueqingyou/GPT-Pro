@@ -86,6 +86,8 @@ services:
     build: ./docker
     image: gpt-pro-cloud-desktop:local
     container_name: gpt-pro-cloud-desktop
+    cap_add:
+      - SYS_ADMIN
     environment:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}

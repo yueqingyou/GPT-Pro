@@ -151,6 +151,7 @@ IP 归属地提供的语言只是地区默认推断，不一定等于操作者�
 ## 安全边界
 
 - Caddy 只向内网发布普通 HTTPS 入口 `:443`；gateway 的 `:36090` 和管理员浏览器的 `:36091` 默认仅绑定回环。打开管理员浏览器时会消费一个三十秒有效的一次性交接凭据，在 `127.0.0.1` 复用已认证的管理员会话；不通过 DNS、Caddy 或父域 Cookie 扩大这个本机边界。desktop 容器、Chromium DevTools 与原始 KasmVNC 端口仍只在私有网络内。
+- desktop 镜像安装与 Chromium 完全同版本的 Debian setuid sandbox，并且只有该服务增加 `SYS_ADMIN`，供 helper 创建 renderer 的 PID 与网络命名空间。Chromium 仍按 `PUID` / `PGID` 运行且没有有效 capability；部署不使用 `privileged`、`--no-sandbox` 或不受限的容器 seccomp profile。
 - 网关不再挂载 `/var/run/docker.sock`。
 - 密码使用逐用户随机盐的 scrypt 摘要；状态和会话文件以当前用户私有权限创建。
 - 登录有限流。修改密码、停用用户或调整工作区授权时，会撤销该用户现有会话和 WebSocket。

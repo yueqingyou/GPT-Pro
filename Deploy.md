@@ -10,6 +10,8 @@
 
 Caddy 是普通用户唯一入口。gateway 的明文端口默认仅绑定 `127.0.0.1`，desktop 的 KasmVNC `3000/3001`、Chromium CDP `9222/9223` 均不映射到宿主机；网关也不挂 Docker Socket。KasmVNC 的资源依赖原生根路径，因此同一 gateway 进程使用独立管理员监听转发，监听地址和管理页跳转均固定为 `http://127.0.0.1:36091/`。
 
+desktop 安装与 Chromium 完全同版本的 Debian setuid sandbox，并且是唯一增加 `SYS_ADMIN` 的服务；该 capability 只供 sandbox helper 创建 renderer 的 PID 与网络命名空间。Chromium 仍按 `PUID`、`PGID` 运行且 browser 与 renderer 都没有有效 capability。Compose 不使用 `privileged`、`--no-sandbox` 或 `seccomp=unconfined`；gateway 与 Caddy 不继承 `SYS_ADMIN`。
+
 持久数据：
 
 | 路径 | 内容 |

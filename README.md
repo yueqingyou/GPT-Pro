@@ -151,6 +151,7 @@ Use the administrator browser when a flow requires browser chrome, a native desk
 ## Security boundary
 
 - Caddy publishes the ordinary HTTPS entry on `:443` to the LAN. Gateway `:36090` and administrator-browser `:36091` bind to loopback by default. Opening the administrator browser consumes a 30-second one-time handoff and reuses the authenticated administrator session on `127.0.0.1`; DNS, Caddy and a parent-domain Cookie are deliberately not used to widen this local boundary. The desktop container itself, Chromium DevTools and raw KasmVNC ports remain private.
+- The desktop image installs Debian's exact-version Chromium setuid sandbox and is the only service granted `SYS_ADMIN` so that helper can create the renderer PID and network namespaces. Chromium still runs as `PUID`/`PGID` without effective capabilities; the deployment does not use `privileged`, `--no-sandbox` or an unconfined container seccomp profile.
 - The gateway no longer mounts `/var/run/docker.sock`.
 - Passwords use per-user salted scrypt hashes. Session and state files are created with private permissions.
 - Login attempts are rate-limited. Changing a password, disabling a user or changing workspace assignments revokes that user's sessions and sockets.

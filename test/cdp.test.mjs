@@ -137,6 +137,32 @@ class WorkspaceBroker extends RuntimeWorkspaceBroker {
   }
 }
 
+class DelayedInputGuardConnection extends FakeConnection {
+  constructor() {
+    super("delayed-input-guard");
+    this.guardStarted = new Promise((resolve) => {
+      this.resolveGuardStarted = resolve;
+    });
+    this.guardRelease = new Promise((resolve) => {
+      this.resolveGuardRelease = resolve;
+    });
+  }
+
+  async call(method, params = {}, sessionId) {
+    if (method === "Runtime.evaluate" && params.expression.includes("inspectSensitiveAction")) {
+      this.calls.push({ method, params, sessionId });
+      this.resolveGuardStarted();
+      await this.guardRelease;
+      return {
+        result: {
+          value: { description: "", tagName: "", ariaLabel: "", testId: "", href: "", editable: false },
+        },
+      };
+    }
+    return super.call(method, params, sessionId);
+  }
+}
+
 test("无响应的 CDP 命令会超时而不是永久卡住初始化", async () => {
   const socket = new EventEmitter();
   socket.readyState = 1;
@@ -1799,6 +1825,34 @@ test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => 
       false,
     );
   } finally {
+    broker.removeViewer("active", viewer);
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("异步输入守卫等待期间失去窗口归属后拒绝旧连接输入", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-stale-input-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({ id: "active", name: "Active", startUrl: "https://chatgpt.com/" });
+  const connection = new DelayedInputGuardConnection();
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const viewer = new FakeViewer();
+  try {
+    await broker.addViewer("active", viewer);
+    const command = broker.handleCommand(
+      "active",
+      { type: "pointer", event: "mousePressed", x: 20, y: 30, button: "left", buttons: 1, clickCount: 1 },
+      null,
+      viewer,
+    );
+    await connection.guardStarted;
+    broker.removeViewer("active", viewer);
+    connection.resolveGuardRelease();
+    await assert.rejects(command, /画面连接不属于当前工作区/);
+    assert.equal(connection.calls.some((call) => call.method === "Input.dispatchMouseEvent"), false);
+  } finally {
+    connection.resolveGuardRelease();
     broker.removeViewer("active", viewer);
     broker.stop();
     rmSync(directory, { recursive: true, force: true });

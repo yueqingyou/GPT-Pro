@@ -18,6 +18,13 @@ test("Compose 只保留一个桌面 Profile 且不挂 Docker Socket", () => {
   assert.doesNotMatch(compose, /^\s+FRAME_IDLE_MS:/m);
   assert.match(compose, /\.\/data-transfer:\/transfer/g);
   assert.doesNotMatch(compose, /docker\.sock/);
+  assert.doesNotMatch(compose, /^\s+privileged:\s*true$/m);
+  const desktopStart = compose.indexOf("\n  desktop:\n");
+  const volumesStart = compose.indexOf("\nvolumes:\n", desktopStart);
+  assert.ok(desktopStart >= 0 && volumesStart > desktopStart);
+  const desktop = compose.slice(desktopStart, volumesStart);
+  assert.match(desktop, /^    cap_add:\n      - SYS_ADMIN$/m);
+  assert.doesNotMatch(`${compose.slice(0, desktopStart)}${compose.slice(volumesStart)}`, /SYS_ADMIN/);
   assert.equal((compose.match(/^  desktop:\s*$/gm) || []).length, 1);
 });
 
@@ -44,6 +51,13 @@ test("Docker 构建上下文排除凭据、Profile 与实验产物", () => {
   for (const path of [".env", "data", "data-panel", "data-transfer", "tmp", "node_modules"]) {
     assert.match(ignored, new RegExp(`^${path.replace(".", "\\.")}$`, "m"));
   }
+});
+
+test("桌面镜像安装 Chromium 沙箱且启动时保持启用", () => {
+  const dockerfile = read("docker/Dockerfile");
+  const autostart = read("docker/autostart");
+  assert.match(dockerfile, /chromium-sandbox="\$\{CHROMIUM_VERSION\}"/);
+  assert.doesNotMatch(autostart, /--no-sandbox|--disable-setuid-sandbox/);
 });
 
 test("启动脚本只在容器健康后打印入口", () => {

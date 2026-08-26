@@ -3,8 +3,8 @@ FROM lscr.io/linuxserver/baseimage-kasmvnc:debianbookworm
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Chromium 版本升级必须重新验证 KasmVNC 软件渲染与 Profile 重启。
-ARG CHROMIUM_SNAPSHOT=20260704T180435Z
-ARG CHROMIUM_VERSION=149.0.7827.196-1~deb12u1
+ARG CHROMIUM_SNAPSHOT=20260824T110509Z
+ARG CHROMIUM_VERSION=151.0.7922.173-1~deb12u1
 
 RUN set -eux; \
     mkdir -p /gpc-apt-bak; \
@@ -24,6 +24,7 @@ RUN set -eux; \
         curl ca-certificates locales \
         fonts-noto-cjk fonts-noto-color-emoji fonts-wqy-microhei \
         chromium="${CHROMIUM_VERSION}" \
+        chromium-sandbox="${CHROMIUM_VERSION}" \
         python3-xlib \
         xdg-desktop-portal xdg-desktop-portal-gtk \
         xsettingsd; \

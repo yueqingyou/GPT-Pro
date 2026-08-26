@@ -44,7 +44,6 @@ while true; do
         set -- "--proxy-server=${PROXY_URL}"
     fi
     /usr/bin/chromium \
-        --no-sandbox \
         --test-type \
         --no-first-run \
         --no-default-browser-check \

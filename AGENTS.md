@@ -32,6 +32,7 @@
 - Chromium 默认下载目录必须固定在独立传输目录；ChatGPT 下载按钮以内联同源文档导航实现时，只转换该次明确下载动作，不得加入普通导航 allowlist；若 CDP 下载行为被其它调试会话重置，只能接管完成事件报告且仍位于该目录内的普通文件，不得回退读取 Profile 的 `Downloads`。
 - 错误处理应失败关闭：用户数据损坏、授权不明确、目标归属缺失或内部通道异常时拒绝访问。
 - 用户可见启动脚本必须等待 desktop 与 gateway 健康后再打印入口，不得把容器仅进入 `Started` 或重启循环误报为启动成功。
+- Chromium 必须安装与浏览器完全同版本的 Debian `chromium-sandbox`，且不得使用 `--no-sandbox`、`--disable-setuid-sandbox`、`privileged` 或 `seccomp=unconfined`；只有 desktop 可增加 setuid sandbox 创建 PID 与网络命名空间所需的 `SYS_ADMIN`，gateway 与 https 不得继承该 capability。
 - 输入桥接改动必须先用临时浏览器会话验证普通工作区的英文、中文组合、表情、原生粘贴、选区复制/剪切、ChatGPT 原生复制按钮、短间隔多窗口复制归属、特殊键与双页面状态隔离，再验证管理员 KasmVNC 原生 IME 的 Unicode 实际落入远端输入框；正式重建前后须以不读取 Cookie 内容的方式确认 Chromium Profile 与 ChatGPT 登录态数据仍存在。
 - 通知改动必须验证原生 `Notification` 对象仍正常创建、标题正文只发往所属工作区、已授权普通页面创建系统通知、未授权或普通 HTTP 页面在右上角显示项目内提醒并于五秒后关闭；远端 ChatGPT 未启用通知权限时，不得宣称真实任务完成通知端到端通过。
 - 代码、配置和 SVG 只保留解释安全边界、协议陷阱或平台差异所必需的注释；用户可见品牌统一使用 `GPT Pro`，不得重新引入旧品牌文案。仓库、镜像、容器和数据目录的既有小写技术标识不为品牌改名而迁移。
@@ -40,6 +41,7 @@
 
 - JavaScript 改动至少执行 `npm test`；网关依赖改动同时执行官方 npm registry 的生产依赖审计。
 - Compose 或容器改动执行 `docker compose config --quiet`，并在真实 Docker 主机验证健康检查、重启恢复与持久化 Profile。
+- Chromium 版本或沙箱改动必须先用临时 Profile 验证失败关闭，再在冷备后核对真实容器中的浏览器版本、setuid helper `4755 root:root`、禁用参数缺失、browser 与 renderer 的零有效 capability，以及 renderer 的 `NoNewPrivs=1` 和 `Seccomp=2`。
 - CDP 转发或连接改动必须验证空闲时间超过建连超时后仍能创建 Target；转发器的建连超时不得残留为长连接读超时。
 - Shell 改动执行匹配实际解释器的 `shellcheck`；Python 改动至少执行语法编译和相关直接测试。
 - 多工作区实验必须验证：一次 ChatGPT 登录、十二个用户各自的十二个目标同时产帧、输入不串线、独立断线重连、Chromium 重启恢复、路径会话不互相覆盖。
