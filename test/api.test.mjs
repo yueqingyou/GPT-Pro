@@ -21,6 +21,7 @@ class FakeBroker {
     this.focusApplications = 0;
     this.maintenanceFocuses = 0;
     this.maintenanceActive = false;
+    this.stateListeners = new Set();
     this.actors = [];
     this.ensuredWorkspaces = [];
     this.projects = [
@@ -43,6 +44,13 @@ class FakeBroker {
     const counts = {};
     for (const viewer of this.viewers) counts[viewer.workspaceId] = (counts[viewer.workspaceId] || 0) + 1;
     return counts;
+  }
+  subscribeState(listener) {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+  notifyState() {
+    for (const listener of this.stateListeners) listener();
   }
   start() {
     this.started = true;
@@ -82,10 +90,12 @@ class FakeBroker {
   }
   async addViewer(workspaceId, socket) {
     this.viewers.push({ workspaceId, socket });
+    this.notifyState();
     socket.send(JSON.stringify({ type: "status", state: "connected" }));
   }
   removeViewer(workspaceId, socket) {
     this.viewers = this.viewers.filter((viewer) => viewer.workspaceId !== workspaceId || viewer.socket !== socket);
+    this.notifyState();
   }
   async handleCommand(workspaceId, command, actor) {
     this.commands.push({ workspaceId, command });
@@ -104,6 +114,30 @@ async function jsonRequest(base, path, { method = "GET", cookie, body, headers =
     body: body ? JSON.stringify(body) : undefined,
   });
   return { response, body: await response.json() };
+}
+
+function serverEvents(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return {
+    async next() {
+      while (!buffer.includes("\n\n")) {
+        const result = await reader.read();
+        assert.equal(result.done, false);
+        buffer += decoder.decode(result.value, { stream: true });
+      }
+      const boundary = buffer.indexOf("\n\n");
+      const event = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const name = event.match(/^event: (.+)$/m)?.[1];
+      const data = event.match(/^data: (.+)$/m)?.[1];
+      return { name, data: JSON.parse(data) };
+    },
+    close() {
+      return reader.cancel();
+    },
+  };
 }
 
 test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自动恢复", async () => {
@@ -155,6 +189,8 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
 
     const unauthenticatedProjects = await jsonRequest(base, "/admin/api/chatgpt-projects");
     assert.equal(unauthenticatedProjects.response.status, 401);
+    const unauthenticatedEvents = await jsonRequest(base, "/admin/api/events");
+    assert.equal(unauthenticatedEvents.response.status, 401);
 
     const officeLogin = await jsonRequest(base, "/w/office/login", {
       method: "POST",
@@ -271,6 +307,30 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
       body: { username: "owner", password: "owner-password" },
     });
     const adminCookie = cookieOf(adminLogin.response);
+    const eventResponse = await fetch(`${base}/admin/api/events`, { headers: { cookie: adminCookie } });
+    assert.equal(eventResponse.status, 200);
+    assert.match(eventResponse.headers.get("content-type"), /^text\/event-stream/);
+    const events = serverEvents(eventResponse);
+    const initialState = await events.next();
+    assert.equal(initialState.name, "state");
+    assert.deepEqual(Object.keys(initialState.data.browser).sort(), ["connected", "targets", "viewers", "workspaces"]);
+    assert.deepEqual(initialState.data.workspaceViewers, { office: 1 });
+
+    const liveLaboratorySocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/w/laboratory/socket?viewer=44444444-4444-4444-8444-444444444444&takeover=1`,
+      { headers: { cookie: labCookie } },
+    );
+    await new Promise((resolveOpen, reject) => {
+      liveLaboratorySocket.once("open", resolveOpen);
+      liveLaboratorySocket.once("error", reject);
+    });
+    const updatedState = await events.next();
+    assert.deepEqual(updatedState.data.workspaceViewers, { office: 1, laboratory: 1 });
+    const laboratoryClosed = new Promise((resolveClose) => liveLaboratorySocket.once("close", resolveClose));
+    liveLaboratorySocket.close();
+    await laboratoryClosed;
+    await events.close();
+
     const projectPreview = await jsonRequest(base, "/admin/api/chatgpt-projects", { cookie: adminCookie });
     assert.equal(projectPreview.response.status, 200);
     assert.deepEqual(projectPreview.body.projects.map((project) => project.status), ["ready", "ready"]);

@@ -266,9 +266,11 @@ test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件
   assert.match(client, /textInput\("name", "例如 测试"\)/);
   assert.match(client, /button\("登出"/);
   assert.match(client, /class: "admin-system-panel"/);
-  assert.match(client, /state\.workspaceViewers\[workspace\.id\]/);
+  assert.match(client, /orderWorkspaces\(state\.workspaces, state\.workspaceViewers\)/);
   assert.match(client, /class: "workspace-presence"/);
-  assert.match(client, /"data-state": viewerCount > 0 \? "online" : "offline"/);
+  assert.match(client, /"data-state": presenceState\.state/);
+  assert.match(client, /new EventSource\("\/admin\/api\/events"\)/);
+  assert.match(client, /orderWorkspaces\(state\.workspaces, live\.workspaceViewers\)/);
   assert.match(client, /href: "\/admin\/maintenance\/"/);
   assert.match(client, /rel: "noopener noreferrer"/);
   assert.match(client, /打开管理员浏览器/);
@@ -281,6 +283,8 @@ test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件
   assert.match(styles, /\.admin-item-list,\n\.project-import-list \{\n  max-height:/);
   assert.match(styles, /\.workspace-presence\[data-state="online"\]/);
   assert.match(server, /workspaceViewers: broker\.viewerCountsByWorkspace\(\)/);
+  assert.match(server, /broker\.subscribeState\(broadcastAdminState\)/);
+  assert.match(cdp, /subscribeState\(listener\)/);
   assert.doesNotMatch(client, /href: "\/admin\/"/);
   assert.doesNotMatch(client, /button\("退出管理"/);
   assert.doesNotMatch(styles, /\.topbar\s*\{[^}]*border-(?:top|bottom)/);

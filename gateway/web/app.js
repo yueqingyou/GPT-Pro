@@ -3,6 +3,7 @@ import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "./text
 const app = globalThis.document?.querySelector("#app") || null;
 const IN_PAGE_NOTICE_MS = 5000;
 const VIEWER_REPLACED_CLOSE_CODE = 4000;
+let adminEvents = null;
 
 const icon = () => node("span", { class: "brand-mark", "aria-hidden": "true" }, "✦");
 
@@ -59,6 +60,26 @@ function formatBytes(value) {
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function orderWorkspaces(workspaces, viewerCounts) {
+  return workspaces
+    .map((workspace, index) => ({ workspace, index }))
+    .sort(
+      (left, right) =>
+        Number((viewerCounts[right.workspace.id] || 0) > 0) -
+          Number((viewerCounts[left.workspace.id] || 0) > 0) ||
+        left.index - right.index,
+    )
+    .map(({ workspace }) => workspace);
+}
+
+function workspacePresence(viewerCount) {
+  return {
+    state: viewerCount > 0 ? "online" : "offline",
+    title: viewerCount > 0 ? `${viewerCount} 个普通用户窗口已连接` : "没有普通用户窗口连接",
+    text: viewerCount > 1 ? `在线 · ${viewerCount} 个窗口` : viewerCount === 1 ? "在线" : "离线",
+  };
 }
 
 function lines(value) {
@@ -252,6 +273,8 @@ function renderAuth({ admin = false, setup = false, workspace = null }) {
 
 async function renderAdmin() {
   document.title = "GPT Pro";
+  adminEvents?.close();
+  adminEvents = null;
   let bootstrap;
   try {
     bootstrap = await request("/admin/api/bootstrap");
@@ -655,9 +678,10 @@ async function renderAdmin() {
   );
 
   const workspaceList = node("div", { class: "stack admin-item-list" });
-  for (const workspace of state.workspaces) {
+  const workspaceItems = new Map();
+  for (const workspace of orderWorkspaces(state.workspaces, state.workspaceViewers)) {
     const viewerCount = state.workspaceViewers[workspace.id] || 0;
-    const presenceText = viewerCount > 1 ? `在线 · ${viewerCount} 个窗口` : viewerCount === 1 ? "在线" : "离线";
+    const presenceState = workspacePresence(viewerCount);
     const name = textInput("name", "名称", { value: workspace.name });
     const startUrl = textInput("startUrl", "https://chatgpt.com/…", { value: workspace.startUrl });
     const save = button("保存", { class: "button small" });
@@ -687,46 +711,47 @@ async function renderAdmin() {
         remove.disabled = false;
       }
     });
-    workspaceList.append(
+    const presence = node(
+      "span",
+      {
+        class: "workspace-presence",
+        "data-state": presenceState.state,
+        title: presenceState.title,
+      },
+      presenceState.text,
+    );
+    const card = node(
+      "details",
+      { class: "item-card item-details workspace-item", "data-workspace-id": workspace.id },
       node(
-        "details",
-        { class: "item-card item-details workspace-item" },
+        "summary",
+        {},
         node(
-          "summary",
-          {},
-          node(
-            "span",
-            { class: "item-summary-main" },
-            node("strong", {}, workspace.name),
-            node("code", {}, workspace.id),
-          ),
-          node(
-            "span",
-            {
-              class: "workspace-presence",
-              "data-state": viewerCount > 0 ? "online" : "offline",
-              title: viewerCount > 0 ? `${viewerCount} 个普通用户窗口已连接` : "没有普通用户窗口连接",
-            },
-            presenceText,
-          ),
+          "span",
+          { class: "item-summary-main" },
+          node("strong", {}, workspace.name),
+          node("code", {}, workspace.id),
         ),
+        presence,
+      ),
+      node(
+        "div",
+        { class: "item-details-body" },
+        node("div", { class: "form-grid" }, field("名称", name), field("起始 / 项目地址", startUrl)),
+        workspace.lastUrl && workspace.lastUrl !== workspace.startUrl
+          ? node("p", { class: "muted compact" }, `最后页面：${workspace.lastUrl}`)
+          : null,
         node(
           "div",
-          { class: "item-details-body" },
-          node("div", { class: "form-grid" }, field("名称", name), field("起始 / 项目地址", startUrl)),
-          workspace.lastUrl && workspace.lastUrl !== workspace.startUrl
-            ? node("p", { class: "muted compact" }, `最后页面：${workspace.lastUrl}`)
-            : null,
-          node(
-            "div",
-            { class: "row-actions" },
-            node("a", { class: "button small ghost", href: `/w/${workspace.id}/`, target: "_blank", rel: "noopener" }, "打开"),
-            save,
-            remove,
-          ),
+          { class: "row-actions" },
+          node("a", { class: "button small ghost", href: `/w/${workspace.id}/`, target: "_blank", rel: "noopener" }, "打开"),
+          save,
+          remove,
         ),
       ),
     );
+    workspaceItems.set(workspace.id, { card, presence });
+    workspaceList.append(card);
   }
 
   const newWorkspaceId = textInput("id", "例如 test");
@@ -898,25 +923,26 @@ async function renderAdmin() {
       }
     },
   });
-  const browserState = state.browser.connected
-    ? "浏览器已连接"
-    : "浏览器正在连接";
+  const browserState = node("strong", {}, state.browser.connected ? "浏览器已连接" : "浏览器正在连接");
+  const browserDot = node("span", { class: state.browser.connected ? "dot online" : "dot" });
+  const workspaceMetric = node("span", {}, `工作区 ${state.browser.targets}/${state.browser.workspaces}`);
+  const viewerMetric = node("span", {}, `在线窗口 ${state.browser.viewers}`);
   const systemPanel = node(
     "section",
     { class: "admin-system-panel" },
     node(
       "div",
       { class: "admin-system-state" },
-      node("span", { class: state.browser.connected ? "dot online" : "dot" }),
+      browserDot,
       node(
         "div",
         { class: "admin-system-copy" },
-        node("strong", {}, browserState),
+        browserState,
         node(
           "span",
           { class: "admin-system-metrics" },
-          node("span", {}, `工作区 ${state.browser.targets}/${state.browser.workspaces}`),
-          node("span", {}, `在线窗口 ${state.browser.viewers}`),
+          workspaceMetric,
+          viewerMetric,
         ),
       ),
     ),
@@ -945,6 +971,25 @@ async function renderAdmin() {
     transferPanel,
   );
   replace(shell("管理", "", content));
+  adminEvents = new EventSource("/admin/api/events");
+  adminEvents.addEventListener("state", (event) => {
+    const live = JSON.parse(event.data);
+    browserDot.className = live.browser.connected ? "dot online" : "dot";
+    browserState.textContent = live.browser.connected ? "浏览器已连接" : "浏览器正在连接";
+    workspaceMetric.textContent = `工作区 ${live.browser.targets}/${live.browser.workspaces}`;
+    viewerMetric.textContent = `在线窗口 ${live.browser.viewers}`;
+    for (const workspace of state.workspaces) {
+      const viewerCount = live.workspaceViewers[workspace.id] || 0;
+      const presenceState = workspacePresence(viewerCount);
+      const { presence } = workspaceItems.get(workspace.id);
+      presence.dataset.state = presenceState.state;
+      presence.title = presenceState.title;
+      presence.textContent = presenceState.text;
+    }
+    for (const workspace of orderWorkspaces(state.workspaces, live.workspaceViewers)) {
+      workspaceList.append(workspaceItems.get(workspace.id).card);
+    }
+  });
 }
 
 function pointerButton(number) {

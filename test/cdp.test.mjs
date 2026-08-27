@@ -1785,8 +1785,13 @@ test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => 
     logger: { warn() {}, error() {} },
   });
   const viewer = new FakeViewer();
+  let stateUpdates = 0;
+  const unsubscribeState = broker.subscribeState(() => {
+    stateUpdates += 1;
+  });
   try {
     await broker.addViewer("active", viewer);
+    assert.ok(stateUpdates > 0);
     const initialStarts = connection.calls.filter((call) => call.method === "Page.startScreencast").length;
     await broker.handleCommand("active", { type: "viewerState", visible: true }, null, viewer);
     const activeStart = connection.calls.filter((call) => call.method === "Page.startScreencast").at(-1);
@@ -1815,7 +1820,9 @@ test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => 
     assert.equal(broker.status().visibleViewers, 1);
     const resumedStart = connection.calls.filter((call) => call.method === "Page.startScreencast").at(-1);
     assert.equal("everyNthFrame" in resumedStart.params, false);
+    const beforeRemoval = stateUpdates;
     broker.removeViewer("active", viewer);
+    assert.ok(stateUpdates > beforeRemoval);
     await assert.rejects(
       () => broker.handleCommand("active", { type: "text", text: "STALE_INPUT" }, null, viewer),
       /画面连接不属于当前工作区/,
@@ -1825,6 +1832,7 @@ test("可见窗口持续使用 60 FPS 连续流且隐藏后停止", async () => 
       false,
     );
   } finally {
+    unsubscribeState();
     broker.removeViewer("active", viewer);
     broker.stop();
     rmSync(directory, { recursive: true, force: true });

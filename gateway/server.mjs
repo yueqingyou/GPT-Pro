@@ -222,6 +222,7 @@ export function createGateway({
   const maintenanceProxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true, xfwd: true });
   const maintenanceSockets = new Set();
   const maintenanceHandoffs = new Map();
+  const adminStreams = new Map();
   const transferCleanup = transfers
     ? setInterval(() => {
         try {
@@ -232,6 +233,37 @@ export function createGateway({
       }, 60 * 60 * 1000)
     : null;
   transferCleanup?.unref?.();
+
+  function adminRuntimeState() {
+    const status = broker.status();
+    return {
+      browser: {
+        connected: status.connected,
+        workspaces: status.workspaces,
+        targets: status.targets,
+        viewers: status.viewers,
+      },
+      workspaceViewers: broker.viewerCountsByWorkspace(),
+    };
+  }
+
+  function sendAdminState(res) {
+    res.write(`event: state\ndata: ${JSON.stringify(adminRuntimeState())}\n\n`);
+  }
+
+  function broadcastAdminState() {
+    for (const res of adminStreams.keys()) sendAdminState(res);
+  }
+
+  function closeAdminStreams(predicate = () => true) {
+    for (const [res, session] of adminStreams) {
+      if (!predicate(session)) continue;
+      adminStreams.delete(res);
+      res.end();
+    }
+  }
+
+  const unsubscribeBrokerState = broker.subscribeState(broadcastAdminState);
 
   maintenanceProxy.on("proxyReq", (proxyRequest) => {
     if (vncPassword) {
@@ -337,13 +369,30 @@ export function createGateway({
 
     if (url.pathname === "/admin/logout" && req.method === "POST") {
       const session = adminSession(req);
-      if (session) sessions.delete(session.token);
+      if (session) {
+        sessions.delete(session.token);
+        closeAdminStreams((stream) => stream.token === session.token);
+      }
       setCookie(req, res, { name: ADMIN_COOKIE, value: "", path: "/", maxAge: 0 });
       return json(res, 200, { ok: true });
     }
 
     const session = adminSession(req);
     if (!session) return json(res, 401, { error: "未登录" });
+
+    if (url.pathname === "/admin/api/events" && req.method === "GET") {
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        connection: "keep-alive",
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer",
+      });
+      adminStreams.set(res, { token: session.token, userId: session.user.id });
+      res.once("close", () => adminStreams.delete(res));
+      sendAdminState(res);
+      return;
+    }
 
     if (url.pathname === "/admin/api/state" && req.method === "GET") {
       return json(res, 200, {
@@ -559,6 +608,7 @@ export function createGateway({
         if (shouldRevoke) {
           sessions.deleteByUser(user.id);
           liveSockets.drop(user.id);
+          closeAdminStreams((stream) => stream.userId === user.id);
         }
         return json(res, 200, { user });
       } catch (error) {
@@ -971,6 +1021,8 @@ export function createGateway({
     async stop() {
       clearInterval(heartbeat);
       if (transferCleanup) clearInterval(transferCleanup);
+      unsubscribeBrokerState();
+      closeAdminStreams();
       for (const socket of maintenanceSockets) socket.destroy();
       maintenanceSockets.clear();
       broker.setMaintenanceActive(false);
