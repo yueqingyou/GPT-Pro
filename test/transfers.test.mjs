@@ -11,12 +11,24 @@ function fixture(options = {}) {
   const store = createTransferStore({
     root: join(directory, "files"),
     stateFile: join(directory, "index.json"),
-    maxFileBytes: 1024 * 1024,
-    quotaBytes: 2 * 1024 * 1024,
+    userQuotaBytes: 1024 * 1024,
     ...options,
   });
   return { directory, store };
 }
+
+test("默认为每个用户提供 1 GB 私人上传空间", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-transfer-default-"));
+  try {
+    const store = createTransferStore({
+      root: join(directory, "files"),
+      stateFile: join(directory, "index.json"),
+    });
+    assert.equal(store.userQuotaBytes, 1024 ** 3);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("私人上传目录按用户隔离并可供该用户的工作区选择", async () => {
   const { directory, store } = fixture();
@@ -106,12 +118,12 @@ test("CDP 下载行为被重置时可接管传输目录中的报告路径", () =
   }
 });
 
-test("下载完成后按实际落盘大小执行容量限制", () => {
+test("下载不设单文件或传输目录容量上限", () => {
   const { directory, store } = fixture();
   try {
-    const id = "download-too-large-1";
-    store.beginDownload({ id, workspaceId: "office", name: "too-large.bin" });
-    const reported = join(store.downloadRoot, "too-large.bin");
+    const id = "download-large-12345";
+    store.beginDownload({ id, workspaceId: "office", name: "large.bin" });
+    const reported = join(store.downloadRoot, "large.bin");
     writeFileSync(reported, Buffer.alloc(1024 * 1024 + 1));
     const completed = store.updateDownload({
       id,
@@ -120,23 +132,16 @@ test("下载完成后按实际落盘大小执行容量限制", () => {
       totalBytes: 1,
       filePath: reported,
     });
-    assert.equal(completed.cancel, true);
-    assert.equal(completed.entry.state, "failed");
-    assert.equal(completed.entry.error, "下载超过文件或目录容量限制");
-    assert.throws(() => readFileSync(reported), /ENOENT/);
-    const canceled = store.updateDownload({ id, state: "canceled" });
-    assert.equal(canceled.terminal, false);
-    assert.equal(canceled.entry.error, "下载超过文件或目录容量限制");
+    assert.equal(completed.cancel, false);
+    assert.equal(completed.entry.state, "ready");
+    assert.equal(store.openDownload(id, { workspaceId: "office" }).size, 1024 * 1024 + 1);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test("并发 Chromium 下载会把其它进行中任务计入总容量", () => {
-  const { directory, store } = fixture({
-    maxFileBytes: 2 * 1024 * 1024,
-    quotaBytes: 3 * 1024 * 1024,
-  });
+test("并发 Chromium 下载不共享应用级总额度", () => {
+  const { directory, store } = fixture();
   try {
     store.beginDownload({ id: "download-first-1234", workspaceId: "office", name: "first.bin" });
     store.beginDownload({ id: "download-second-123", workspaceId: "office", name: "second.bin" });
@@ -153,31 +158,80 @@ test("并发 Chromium 下载会把其它进行中任务计入总容量", () => {
       totalBytes: 2 * 1024 * 1024,
     });
     assert.equal(first.cancel, false);
-    assert.equal(second.cancel, true);
-    assert.equal(second.entry.state, "failed");
+    assert.equal(second.cancel, false);
+    assert.equal(second.entry.state, "in_progress");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test("单文件、总容量与损坏索引均失败关闭", async () => {
+test("每个用户的私人空间独立计量且删除后立即释放", async () => {
   const { directory, store } = fixture();
   try {
+    const first = await store.receiveUpload(Readable.from([Buffer.alloc(700 * 1024)]), {
+      userId: "user-office",
+      name: "first.bin",
+      declaredSize: 700 * 1024,
+    });
+    assert.deepEqual(store.userUsage("user-office"), {
+      usedBytes: 700 * 1024,
+      quotaBytes: 1024 * 1024,
+      availableBytes: 324 * 1024,
+    });
     await assert.rejects(
-      () => store.receiveUpload(Readable.from([Buffer.alloc(1024 * 1024 + 1)]), {
+      () => store.receiveUpload(Readable.from([Buffer.alloc(400 * 1024)]), {
         userId: "user-office",
-        name: "oversized.bin",
-        declaredSize: 1024 * 1024 + 1,
+        name: "second.bin",
+        declaredSize: 400 * 1024,
       }),
-      /不能超过/,
+      /容量上限/,
     );
+    const otherUser = await store.receiveUpload(Readable.from([Buffer.alloc(700 * 1024)]), {
+      userId: "user-laboratory",
+      name: "other.bin",
+      declaredSize: 700 * 1024,
+    });
+    assert.equal(otherUser.state, "ready");
+    store.remove(first.id, { userId: "user-office" });
+    assert.equal(store.userUsage("user-office").usedBytes, 0);
+    const replacement = await store.receiveUpload(Readable.from([Buffer.alloc(1024 * 1024)]), {
+      userId: "user-office",
+      name: "full-quota.bin",
+      declaredSize: 1024 * 1024,
+    });
+    assert.equal(replacement.size, 1024 * 1024);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("私人文件不按时间自动删除", async () => {
+  let currentTime = Date.parse("2026-08-27T00:00:00.000Z");
+  const { directory, store } = fixture({ now: () => currentTime });
+  try {
+    const uploaded = await store.receiveUpload(Readable.from([Buffer.from("KEEP")]), {
+      userId: "user-office",
+      name: "keep.txt",
+      declaredSize: 4,
+    });
+    currentTime += 365 * 24 * 60 * 60 * 1000;
+    assert.equal(store.cleanup(), false);
+    assert.equal(readFileSync(store.remotePath(uploaded.id), "utf8"), "KEEP");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("用户空间配置与损坏索引均失败关闭", () => {
+  const { directory } = fixture();
+  try {
     assert.throws(
       () => createTransferStore({
         root: join(directory, "invalid-limits"),
         stateFile: join(directory, "invalid-limits.json"),
-        maxFileBytes: "invalid",
+        userQuotaBytes: "invalid",
       }),
-      /单文件容量上限/,
+      /用户私人空间上限/,
     );
     const stateFile = join(directory, "index.json");
     writeFileSync(

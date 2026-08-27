@@ -12,6 +12,7 @@ test("Compose 只保留一个桌面 Profile 且不挂 Docker Socket", () => {
   assert.match(compose, /PROFILE_AUTO_DETECT:/);
   assert.match(compose, /PROFILE_GEO_ENDPOINT:/);
   assert.match(compose, /FRAME_ACTIVE_FPS:/);
+  assert.doesNotMatch(compose, /MAX_FILE_BYTES|TRANSFER_QUOTA_BYTES/);
   assert.match(compose, /user: "\$\{PUID:-1000\}:\$\{PGID:-1000\}"/);
   assert.match(compose, /- "127\.0\.0\.1:\$\{MAINTENANCE_PORT:-36091\}:8081"/);
   assert.doesNotMatch(compose, /MAINTENANCE_(?:BIND_ADDR|PUBLIC_URL|PUBLIC_PORT)/);
@@ -239,6 +240,11 @@ test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件
   assert.match(styles, /\.viewer-panel-actions \{[^}]*gap: 6px;/s);
   assert.match(styles, /\.viewer-panel-actions \.button \{[^}]*min-height: 32px;/s);
   assert.match(styles, /\.viewer-transfer-panel \{\n\s+position: absolute;/);
+  assert.match(styles, /\.viewer-transfer-storage/);
+  assert.match(client, /\u5df2\u7528 \$\{formatBytes\(used\)\} \/ \$\{formatBytes\(quota\)\}/);
+  assert.match(client, /\u79c1\u4eba\u6587\u4ef6\u4f1a\u6c38\u4e45\u4fdd\u7559/);
+  assert.match(server, /transferStorage: transfers/);
+  assert.doesNotMatch(server, /MAX_FILE_BYTES|TRANSFER_QUOTA_BYTES|transferCleanup/);
   assert.doesNotMatch(styles, /object-fit:\s*contain/);
   assert.match(cdp, /MIN_VIEWPORT_WIDTH = 320/);
   assert.match(cdp, /MIN_VIEWPORT_HEIGHT = 240/);

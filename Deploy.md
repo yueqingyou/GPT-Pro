@@ -112,11 +112,11 @@ cp .env.example .env
 
 普通工作区点击“上传文件”后，文件只流式写入 `data-transfer/uploads/<user-id>/`，不访问网页文件控件。要把文件交给 ChatGPT，用户必须先在 ChatGPT 页面手动点击上传。Chromium 随后通过会话 D-Bus 调用标准 XDG Desktop Portal FileChooser，并携带触发窗口的 X11 XID；自定义 Portal 后端只接受带 `_GPC_WINDOW_KIND=workspace` 与有效 `_GPC_WORKSPACE_ID` 的 Chromium 顶层窗口，再通过运行期 Unix socket 把请求交给 gateway。网关消费该工作区近期输入所属的用户和普通窗口，只向这个窗口显示私人文件面板。用户确认后，gateway 解析其拥有的上传记录，Portal 再把受限的 `file://` URI 返回 Chromium，由 Chromium 自行创建网页标准 `FileList`。
 
-这条路径不启用 `Page.setInterceptFileChooserDialog`，不调用 `DOM.setFileInputFiles`，不查找网页 `<input type=file>`，也不使用 Linux 对话框坐标自动化。管理员顶层窗口带独立 `administrator` 标记，其 FileChooser 请求由同一后端转交 `xdg-desktop-portal-gtk`，所以完整管理员浏览器仍显示原生 GTK 文件选择器。无有效窗口标记、无近期所属用户输入、用户或工作区归属不一致、请求连接关闭时都取消当次选择，不保留等待下一次选择器的任务。私人上传默认保留 24 小时，管理页或工作区文件面板也可提前删除。
+这条路径不启用 `Page.setInterceptFileChooserDialog`，不调用 `DOM.setFileInputFiles`，不查找网页 `<input type=file>`，也不使用 Linux 对话框坐标自动化。管理员顶层窗口带独立 `administrator` 标记，其 FileChooser 请求由同一后端转交 `xdg-desktop-portal-gtk`，所以完整管理员浏览器仍显示原生 GTK 文件选择器。无有效窗口标记、无近期所属用户输入、用户或工作区归属不一致、请求连接关闭时都取消当次选择，不保留等待下一次选择器的任务。私人上传不按时间自动删除，只由用户或管理员在文件面板手动删除。
 
 Chromium 下载统一写入 `data-transfer/downloads/`。普通用户明确点击 ChatGPT 的 `Download` 或 `Download file` 后，网关会把网页的同源内容导航转换为带原文件名的 Chromium 下载；当前对话保持不变，普通页面的其它导航限制也不会放宽。网关优先让 CDP 按下载 GUID 命名；Chromium 的持久默认下载目录也固定到同一位置，因此其它 DevTools 会话重置该行为时，网关仍可依据完成事件报告的受限目录路径接管并改名，且不会读取 Profile 内的 `Downloads`。下载完成后，普通用户浏览器发送包含文件名和已保存到私人文件区的系统通知，未授权时改为右上角五秒页面提醒；下载失败时按相同方式显示文件名和网关返回的失败原因。由普通工作区触发的下载只出现在该工作区的“查看文件”面板；管理员可在管理页查看全部下载。由管理员浏览器触发且无法归属工作区的下载只对管理员可见。点击“保存到本机”后，由网关鉴权并以附件响应传给当前设备。
 
-`MAX_FILE_BYTES` 限制单个上传或下载，`TRANSFER_QUOTA_BYTES` 限制目录总量。超过限制的上传会在流式接收过程中终止；Chromium 下载会被取消并删除不完整文件。gateway 和 desktop 只共享 `data-transfer/` 与不持久化的 Portal 运行期 socket，gateway 不挂载 `data/browser/`。
+每个用户的私人上传总量限制为 1 GiB，在声明大小预检和流式接收过程中都按该用户现有文件独立计量；删除后立即释放空间。不另设单文件上限或全服务器总容量上限，下载也不受应用级容量上限。gateway 和 desktop 只共享 `data-transfer/` 与不持久化的 Portal 运行期 socket，gateway 不挂载 `data/browser/`。
 
 ## 时区与语言
 

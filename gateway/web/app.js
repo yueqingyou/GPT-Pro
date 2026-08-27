@@ -97,7 +97,9 @@ function uploadFile(url, file, onProgress = () => {}) {
     xhr.setRequestHeader("x-gpc-file-name", encodeURIComponent(file.name));
     xhr.setRequestHeader("content-type", file.type || "application/octet-stream");
     xhr.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) onProgress(event.loaded / event.total);
+      if (event.lengthComputable) {
+        onProgress({ loaded: event.loaded, total: event.total, ratio: event.loaded / event.total });
+      }
     });
     xhr.addEventListener("load", () => {
       const body = xhr.response || {};
@@ -595,20 +597,16 @@ async function renderAdmin() {
     const files = [...adminUploadInput.files];
     adminUploadInput.value = "";
     if (!files.length) return;
-    if (files.length > 10) {
-      show("一次最多选择 10 个文件");
-      return;
-    }
     adminUpload.disabled = true;
     try {
       let last;
       for (let index = 0; index < files.length; index += 1) {
         const file = files[index];
-        if (state.transferLimits && file.size > state.transferLimits.maxFileBytes) {
-          throw new Error(`${file.name} 超过单文件上限 ${formatBytes(state.transferLimits.maxFileBytes)}`);
-        }
-        last = await uploadFile("/admin/api/uploads", file, (progress) => {
-          show(`正在上传 ${index + 1}/${files.length}：${file.name} · ${Math.round(progress * 100)}%`, "success");
+        last = await uploadFile("/admin/api/uploads", file, ({ loaded, total, ratio }) => {
+          show(
+            `正在上传 ${index + 1}/${files.length}：${file.name} · ${formatBytes(loaded)} / ${formatBytes(total)} · ${Math.round(ratio * 100)}%`,
+            "success",
+          );
         });
       }
       show(
@@ -669,8 +667,8 @@ async function renderAdmin() {
     node(
       "p",
       { class: "muted" },
-      state.transferLimits
-        ? `单文件上限 ${formatBytes(state.transferLimits.maxFileBytes)}，总容量 ${formatBytes(state.transferLimits.quotaBytes)}。`
+      state.transferStorage
+        ? `每个用户的私人上传空间为 ${formatBytes(state.transferStorage.userQuotaBytes)}；文件不自动删除，单文件和服务器总量不设应用级上限。`
         : "当前部署没有启用文件传输。",
     ),
     node("div", { class: "row-actions" }, adminUpload, adminUploadInput),
@@ -1418,8 +1416,31 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   transferPanel = node("aside", { class: "viewer-transfer-panel", hidden: true });
   const transferFiles = node("div", { class: "viewer-transfer-files" });
   const transferHint = node("p", { class: "muted" });
+  const transferStorageText = node("strong");
+  const transferStorageAvailable = node("span", { class: "muted" });
+  const transferStorageProgress = node("progress", {
+    max: fileTransfer.quotaBytes || 1,
+    value: fileTransfer.usedBytes || 0,
+    "aria-label": "私人空间用量",
+  });
+  const transferStorage = node(
+    "div",
+    { class: "viewer-transfer-storage" },
+    node("div", {}, transferStorageText, transferStorageAvailable),
+    transferStorageProgress,
+  );
+  const renderTransferStorage = (storage = fileTransfer) => {
+    const used = Math.max(0, Number(storage?.usedBytes) || 0);
+    const quota = Math.max(1, Number(storage?.quotaBytes) || 1);
+    transferStorageText.textContent = `已用 ${formatBytes(used)} / ${formatBytes(quota)}`;
+    transferStorageAvailable.textContent = `可用 ${formatBytes(Math.max(0, quota - used))}`;
+    transferStorageProgress.max = quota;
+    transferStorageProgress.value = Math.min(used, quota);
+  };
+  renderTransferStorage();
   const updateSelectionButton = () => {
     confirmSelection.disabled = !selectedUploadIds.size;
+    confirmSelection.textContent = selectedUploadIds.size ? `使用所选（${selectedUploadIds.size}）` : "使用所选";
   };
   confirmSelection = button("选择文件", {
     class: "button small",
@@ -1460,11 +1481,13 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       node("h2", {}, "私人文件"),
       node("div", { class: "row-actions" }, confirmSelection, closeTransfers),
     ),
+    transferStorage,
     transferHint,
     transferFiles,
   );
 
-  const renderTransferFiles = (files) => {
+  const renderTransferFiles = ({ files, storage }) => {
+    renderTransferStorage(storage);
     transferFiles.replaceChildren();
     const availableUploads = new Set(
       files.filter((file) => file.kind === "upload" && file.state === "ready").map((file) => file.id),
@@ -1473,7 +1496,8 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       if (!availableUploads.has(id)) selectedUploadIds.delete(id);
     }
     const stateLabels = { ready: "可用", in_progress: "下载中", failed: "失败" };
-    for (const file of files) {
+    const orderedFiles = [...files].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+    for (const file of orderedFiles) {
       const selectable = fileSelection.active && file.kind === "upload" && file.state === "ready";
       const selector = selectable
         ? node("input", {
@@ -1537,7 +1561,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   async function refreshTransfers() {
     if (!fileTransfer.enabled) return;
     const result = await request(`/w/${workspace.id}/api/transfers`);
-    renderTransferFiles(result.files);
+    renderTransferFiles(result);
   }
 
   async function openTransferPanel(selecting = false) {
@@ -1554,8 +1578,8 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     menuToggle.setAttribute("aria-label", "打开工作区菜单");
     confirmSelection.hidden = !fileSelection.active;
     transferHint.textContent = fileSelection.active
-      ? "选择要交给当前 ChatGPT 上传入口的文件。"
-      : "上传文件仅保存于当前用户的私人目录；远端下载可保存到本机。";
+      ? "勾选要交给当前 ChatGPT 文件选择器的私人文件。"
+      : "私人文件会永久保留，直到你手动删除。要交给 ChatGPT，请在页面中点击添加文件后回到此处确认。";
     transferPanel.hidden = false;
     await refreshTransfers();
   }
@@ -1570,20 +1594,16 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     const files = [...uploadInput.files];
     uploadInput.value = "";
     if (!files.length) return;
-    if (files.length > 10) {
-      setStatus("一次最多选择 10 个文件", "error");
-      return;
-    }
     upload.disabled = true;
     try {
       const uploaded = [];
       for (let index = 0; index < files.length; index += 1) {
         const file = files[index];
-        if (fileTransfer.maxFileBytes && file.size > fileTransfer.maxFileBytes) {
-          throw new Error(`${file.name} 超过单文件上限 ${formatBytes(fileTransfer.maxFileBytes)}`);
-        }
-        const result = await uploadFile(`/w/${workspace.id}/api/uploads`, file, (progress) => {
-          setStatus(`上传 ${index + 1}/${files.length}：${Math.round(progress * 100)}%`, "online");
+        const result = await uploadFile(`/w/${workspace.id}/api/uploads`, file, ({ loaded, total, ratio }) => {
+          setStatus(
+            `上传 ${index + 1}/${files.length}：${file.name} · ${formatBytes(loaded)} / ${formatBytes(total)} · ${Math.round(ratio * 100)}%`,
+            "online",
+          );
         });
         uploaded.push(result.file);
       }

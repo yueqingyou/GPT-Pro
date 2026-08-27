@@ -223,17 +223,6 @@ export function createGateway({
   const maintenanceSockets = new Set();
   const maintenanceHandoffs = new Map();
   const adminStreams = new Map();
-  const transferCleanup = transfers
-    ? setInterval(() => {
-        try {
-          transfers.cleanup();
-        } catch (error) {
-          logger.warn?.(`清理暂存文件失败：${error.message}`);
-        }
-      }, 60 * 60 * 1000)
-    : null;
-  transferCleanup?.unref?.();
-
   function adminRuntimeState() {
     const status = broker.status();
     return {
@@ -408,8 +397,8 @@ export function createGateway({
               ...(entry.kind === "upload" ? { remotePath: transfers.remotePath(entry.id) } : {}),
             }))
           : [],
-        transferLimits: transfers
-          ? { maxFileBytes: transfers.maxFileBytes, quotaBytes: transfers.quotaBytes }
+        transferStorage: transfers
+          ? { userQuotaBytes: transfers.userQuotaBytes }
           : null,
         browser: broker.status(),
         workspaceViewers: broker.viewerCountsByWorkspace(),
@@ -650,7 +639,7 @@ export function createGateway({
         workspace: session ? publicWorkspace(workspace) : { id: workspace.id, name: workspace.name },
         browser: session ? broker.status() : undefined,
         fileTransfer: session && transfers
-          ? { enabled: true, maxFileBytes: transfers.maxFileBytes }
+          ? { enabled: true, ...transfers.userUsage(session.user.id) }
           : { enabled: false },
         sensitivePolicyEnabled: session ? store.sensitivePolicy().enabled : undefined,
       });
@@ -704,6 +693,7 @@ export function createGateway({
       if (!transfers) return json(res, 200, { files: [] });
       return json(res, 200, {
         files: transfers.listUserFiles({ workspaceId: route.id, userId: session.user.id }),
+        storage: transfers.userUsage(session.user.id),
       });
     }
 
@@ -1020,7 +1010,6 @@ export function createGateway({
     },
     async stop() {
       clearInterval(heartbeat);
-      if (transferCleanup) clearInterval(transferCleanup);
       unsubscribeBrokerState();
       closeAdminStreams();
       for (const socket of maintenanceSockets) socket.destroy();
@@ -1051,8 +1040,6 @@ export function createDefaultGateway(env = process.env) {
   const transfers = createTransferStore({
     root: env.TRANSFER_ROOT || "/transfer",
     stateFile: env.TRANSFER_STATE_FILE || join(dirname(stateFile), "transfers.json"),
-    maxFileBytes: Number(env.MAX_FILE_BYTES || 512 * 1024 * 1024),
-    quotaBytes: Number(env.TRANSFER_QUOTA_BYTES || 4 * 1024 * 1024 * 1024),
     ownerUid: Number(env.PUID || 1000),
     ownerGid: Number(env.PGID || 1000),
   });

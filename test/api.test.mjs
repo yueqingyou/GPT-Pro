@@ -152,8 +152,7 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
   const transfers = createTransferStore({
     root: join(directory, "transfers"),
     stateFile: join(directory, "transfers.json"),
-    maxFileBytes: 1024 * 1024,
-    quotaBytes: 4 * 1024 * 1024,
+    userQuotaBytes: 1024 * 1024,
   });
   const broker = new FakeBroker();
   const maintenanceUpstream = http.createServer((_request, response) => response.end("maintenance-ok"));
@@ -212,6 +211,12 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
     const laboratory = await jsonRequest(base, "/w/laboratory/api/bootstrap", { cookie: labCookie });
     assert.equal(office.body.user.username, "office-user");
     assert.equal(laboratory.body.user.username, "lab-user");
+    assert.deepEqual(office.body.fileTransfer, {
+      enabled: true,
+      usedBytes: 0,
+      quotaBytes: 1024 * 1024,
+      availableBytes: 1024 * 1024,
+    });
     const crossed = await jsonRequest(base, "/w/laboratory/api/bootstrap", { cookie: officeCookie });
     assert.equal(crossed.body.authenticated, false);
     const crossSite = await jsonRequest(base, "/w/office/logout", {
@@ -393,6 +398,7 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
       "Deep research",
     ]);
     assert.deepEqual(stateResponse.body.workspaceViewers, { office: 1 });
+    assert.deepEqual(stateResponse.body.transferStorage, { userQuotaBytes: 1024 * 1024 });
     const publicHealth = await jsonRequest(base, "/healthz");
     assert.equal(Object.hasOwn(publicHealth.body, "workspaceViewers"), false);
     assert.equal(Object.hasOwn(publicHealth.body.browser, "workspaceViewers"), false);
@@ -433,6 +439,16 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
     const labTransfers = await jsonRequest(base, "/w/laboratory/api/transfers", { cookie: labCookie });
     assert.equal(officeTransfers.body.files.length, 1);
     assert.equal(labTransfers.body.files.length, 0);
+    assert.deepEqual(officeTransfers.body.storage, {
+      usedBytes: 15,
+      quotaBytes: 1024 * 1024,
+      availableBytes: 1024 * 1024 - 15,
+    });
+    assert.deepEqual(labTransfers.body.storage, {
+      usedBytes: 0,
+      quotaBytes: 1024 * 1024,
+      availableBytes: 1024 * 1024,
+    });
     assert.equal(Object.hasOwn(officeTransfers.body.files[0], "remotePath"), false);
 
     const downloadId = "download-12345678";

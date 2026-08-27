@@ -53,8 +53,6 @@ services:
       JPEG_QUALITY: ${JPEG_QUALITY:-72}
       TRANSFER_ROOT: /transfer
       TRANSFER_STATE_FILE: /data/transfers.json
-      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-536870912}
-      TRANSFER_QUOTA_BYTES: ${TRANSFER_QUOTA_BYTES:-4294967296}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       TZ: ${TZ:-Asia/Shanghai}
