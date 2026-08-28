@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { installAdministratorPaste } from "../gateway/web/admin-browser.js";
+import { installAdministratorDownloads, installAdministratorPaste } from "../gateway/web/admin-browser.js";
 import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "../gateway/web/text-input.js";
 
 class FakeInput extends EventTarget {
@@ -115,6 +115,44 @@ test("管理员粘贴先同步当次剪贴板再发送一次远端 Ctrl+V", () =
     "up:KeyV",
     "up:ControlLeft",
   ]);
+});
+
+test("管理员浏览器收到下载完成事件后直接交给本机浏览器", () => {
+  class FakeEventSource extends EventTarget {
+    constructor(url) {
+      super();
+      this.url = url;
+      source = this;
+    }
+  }
+  let source;
+  const links = [];
+  const document = {
+    body: { append: (link) => links.push(link) },
+    createElement(name) {
+      assert.equal(name, "a");
+      return {
+        click() { this.clicked = true; },
+        remove() { this.removed = true; },
+      };
+    },
+  };
+  installAdministratorDownloads(document, FakeEventSource);
+  assert.equal(source.url, "/__gpc/download-events");
+
+  const progress = new Event("download");
+  Object.defineProperty(progress, "data", { value: JSON.stringify({ id: "admin-file-1234", name: "结果.csv", state: "in_progress" }) });
+  source.dispatchEvent(progress);
+  assert.equal(links.length, 0);
+
+  const ready = new Event("download");
+  Object.defineProperty(ready, "data", { value: JSON.stringify({ id: "admin-file-1234", name: "结果.csv", state: "ready" }) });
+  source.dispatchEvent(ready);
+  assert.equal(links.length, 1);
+  assert.equal(links[0].href, "/__gpc/files/admin-file-1234");
+  assert.equal(links[0].download, "结果.csv");
+  assert.equal(links[0].clicked, true);
+  assert.equal(links[0].removed, true);
 });
 
 test("远端选区映射到本机隐藏输入框供原生复制与剪切", () => {

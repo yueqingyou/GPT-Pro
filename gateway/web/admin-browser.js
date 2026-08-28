@@ -34,8 +34,23 @@ export function installAdministratorPaste(documentRef, EventCtor, KeyboardEventC
   }, true);
 }
 
+export function installAdministratorDownloads(documentRef, EventSourceCtor) {
+  const events = new EventSourceCtor("/__gpc/download-events");
+  events.addEventListener("download", (event) => {
+    const file = JSON.parse(event.data);
+    if (file.state !== "ready") return;
+    const link = documentRef.createElement("a");
+    link.href = `/__gpc/files/${encodeURIComponent(file.id)}`;
+    link.download = file.name;
+    documentRef.body.append(link);
+    link.click();
+    link.remove();
+  });
+  return events;
+}
+
 export function installAdministratorBrowser(environment = globalThis) {
-  const { document, Event, KeyboardEvent, MutationObserver } = environment;
+  const { document, Event, EventSource, KeyboardEvent, MutationObserver } = environment;
   document.title = "GPT Pro";
   const title = document.querySelector("title");
   new MutationObserver(() => {
@@ -45,6 +60,7 @@ export function installAdministratorBrowser(environment = globalThis) {
   const ime = document.querySelector("#noVNC_setting_enable_ime");
   const keyboardInput = document.querySelector("#noVNC_keyboardinput");
   installAdministratorPaste(document, Event, KeyboardEvent);
+  installAdministratorDownloads(document, EventSource);
   ime.closest("label").hidden = true;
   const positionCaret = () => keyboardInput.setSelectionRange(keyboardInput.value.length, keyboardInput.value.length);
   keyboardInput.addEventListener("focus", positionCaret);

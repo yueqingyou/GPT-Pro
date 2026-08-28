@@ -341,6 +341,9 @@ test("管理员浏览器保留完整 Chromium 界面与扩展管理能力", () =
   assert.doesNotMatch(hideKasm, /<title>ChatGPT<\/title>/);
   assert.match(adminBrowser, /noVNC_setting_enable_ime/);
   assert.match(adminBrowser, /installAdministratorPaste/);
+  assert.match(adminBrowser, /installAdministratorDownloads/);
+  assert.match(adminBrowser, /new EventSourceCtor\("\/__gpc\/download-events"\)/);
+  assert.match(adminBrowser, /link\.href = `\/__gpc\/files\/\$\{encodeURIComponent\(file\.id\)\}`/);
   assert.match(adminBrowser, /event\.clipboardData\?\.getData\("text\/plain"\)/);
   assert.match(adminBrowser, /clipboardInput\.dispatchEvent\(new EventCtor\("change"/);
   assert.match(adminBrowser, /code: "KeyV", ctrlKey: true/);

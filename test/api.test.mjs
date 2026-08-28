@@ -22,6 +22,7 @@ class FakeBroker {
     this.maintenanceFocuses = 0;
     this.maintenanceActive = false;
     this.stateListeners = new Set();
+    this.adminDownloadListeners = new Set();
     this.actors = [];
     this.ensuredWorkspaces = [];
     this.projects = [
@@ -48,6 +49,13 @@ class FakeBroker {
   subscribeState(listener) {
     this.stateListeners.add(listener);
     return () => this.stateListeners.delete(listener);
+  }
+  subscribeAdminDownloads(listener) {
+    this.adminDownloadListeners.add(listener);
+    return () => this.adminDownloadListeners.delete(listener);
+  }
+  notifyAdminDownload(file) {
+    for (const listener of this.adminDownloadListeners) listener(file);
   }
   notifyState() {
     for (const listener of this.stateListeners) listener();
@@ -479,6 +487,8 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
     const maintenanceBase = `http://127.0.0.1:${maintenanceGateway.port}`;
     assert.equal((await fetch(maintenanceBase)).status, 401);
     assert.equal((await fetch(`${maintenanceBase}/__gpc/admin-browser.js`)).status, 401);
+    assert.equal((await fetch(`${maintenanceBase}/__gpc/download-events`)).status, 401);
+    assert.equal((await fetch(`${maintenanceBase}/__gpc/files/admin-download-1234`)).status, 401);
     const handoffResponse = await fetch(`${maintenanceBase}/?handoff=${handoffLocation.searchParams.get("handoff")}`, {
       redirect: "manual",
     });
@@ -495,6 +505,30 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
     const maintenanceScript = await fetch(`${maintenanceBase}/__gpc/admin-browser.js`, { headers: { cookie: maintenanceCookie } });
     assert.equal(maintenanceScript.status, 200);
     assert.match(await maintenanceScript.text(), /noVNC_setting_enable_ime/);
+    const adminDownloadEvents = await fetch(`${maintenanceBase}/__gpc/download-events`, {
+      headers: { cookie: maintenanceCookie },
+    });
+    assert.equal(adminDownloadEvents.status, 200);
+    assert.match(adminDownloadEvents.headers.get("content-type"), /text\/event-stream/);
+    const adminDownloadStream = serverEvents(adminDownloadEvents);
+    const adminDownloadId = "admin-download-1234";
+    transfers.beginDownload({ id: adminDownloadId, name: "管理员结果.csv" });
+    writeFileSync(transfers.remotePath(adminDownloadId), "ADMIN_DOWNLOAD");
+    const adminDownload = transfers.updateDownload({
+      id: adminDownloadId,
+      state: "completed",
+      receivedBytes: 14,
+      totalBytes: 14,
+    }).entry;
+    broker.notifyAdminDownload(adminDownload);
+    assert.deepEqual(await adminDownloadStream.next(), { name: "download", data: adminDownload });
+    const localAdminDownload = await fetch(`${maintenanceBase}/__gpc/files/${adminDownloadId}`, {
+      headers: { cookie: maintenanceCookie },
+    });
+    assert.equal(localAdminDownload.status, 200);
+    assert.equal(await localAdminDownload.text(), "ADMIN_DOWNLOAD");
+    assert.match(localAdminDownload.headers.get("content-disposition"), /filename\*=UTF-8/);
+    await adminDownloadStream.close();
     const maintenanceRoot = await fetch(maintenanceBase, {
       headers: { cookie: maintenanceCookie },
       redirect: "manual",

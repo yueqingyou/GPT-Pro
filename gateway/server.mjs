@@ -241,7 +241,15 @@ export function createGateway({
   }
 
   function broadcastAdminState() {
-    for (const res of adminStreams.keys()) sendAdminState(res);
+    for (const [res, stream] of adminStreams) {
+      if (stream.kind === "state") sendAdminState(res);
+    }
+  }
+
+  function broadcastAdminDownload(file) {
+    for (const [res, stream] of adminStreams) {
+      if (stream.kind === "downloads") res.write(`event: download\ndata: ${JSON.stringify(file)}\n\n`);
+    }
   }
 
   function closeAdminStreams(predicate = () => true) {
@@ -253,6 +261,7 @@ export function createGateway({
   }
 
   const unsubscribeBrokerState = broker.subscribeState(broadcastAdminState);
+  const unsubscribeAdminDownloads = broker.subscribeAdminDownloads(broadcastAdminDownload);
 
   maintenanceProxy.on("proxyReq", (proxyRequest) => {
     if (vncPassword) {
@@ -377,7 +386,7 @@ export function createGateway({
         "x-content-type-options": "nosniff",
         "referrer-policy": "no-referrer",
       });
-      adminStreams.set(res, { token: session.token, userId: session.user.id });
+      adminStreams.set(res, { token: session.token, userId: session.user.id, kind: "state" });
       res.once("close", () => adminStreams.delete(res));
       sendAdminState(res);
       return;
@@ -828,6 +837,29 @@ export function createGateway({
       serveFile(webDir, res, "/admin-browser.js");
       return;
     }
+    if (req.method === "GET" && url.pathname === "/__gpc/download-events") {
+      const session = adminSession(req);
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        connection: "keep-alive",
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer",
+      });
+      adminStreams.set(res, { token: session.token, userId: session.user.id, kind: "downloads" });
+      res.once("close", () => adminStreams.delete(res));
+      res.flushHeaders();
+      return;
+    }
+    const adminDownload = url.pathname.match(/^\/__gpc\/files\/([a-zA-Z0-9-]{8,80})$/);
+    if (adminDownload && (req.method === "GET" || req.method === "HEAD")) {
+      if (!transfers) return json(res, 503, { error: "当前部署没有启用文件传输" });
+      try {
+        return sendTransferFile(req, res, transfers.openDownload(adminDownload[1], { isAdmin: true }));
+      } catch (error) {
+        return json(res, error.status || 404, { error: error.message });
+      }
+    }
     if (req.method === "GET" && url.pathname === "/") {
       await broker.focusMaintenance();
       res.writeHead(302, { location: "/vnc/", "cache-control": "no-store" });
@@ -1011,6 +1043,7 @@ export function createGateway({
     async stop() {
       clearInterval(heartbeat);
       unsubscribeBrokerState();
+      unsubscribeAdminDownloads();
       closeAdminStreams();
       for (const socket of maintenanceSockets) socket.destroy();
       maintenanceSockets.clear();

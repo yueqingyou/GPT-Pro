@@ -1343,6 +1343,62 @@ test("Chromium 下载只在开始和结束时刷新普通页面文件状态", as
   }
 });
 
+test("管理员浏览器下载完成后只通知管理员本机下载通道", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-admin-download-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({ id: "office", name: "Office", startUrl: "https://chatgpt.com/" });
+  const entries = new Map();
+  const transferStore = {
+    downloadRoot: "/transfer/downloads",
+    beginDownload({ id, workspaceId, name }) {
+      const entry = { id, workspaceId, name, kind: "download", state: "in_progress" };
+      entries.set(id, entry);
+      return entry;
+    },
+    updateDownload({ id, state }) {
+      const entry = { ...entries.get(id), state: state === "completed" ? "ready" : "in_progress" };
+      entries.set(id, entry);
+      return { entry, cancel: false, retry: false, terminal: state === "completed" };
+    },
+  };
+  const connection = new FakeConnection("admin-download-events");
+  const broker = new WorkspaceBroker({
+    store,
+    transferStore,
+    connect: async () => connection,
+    logger: { warn() {}, error() {} },
+  });
+  const downloads = [];
+  const unsubscribe = broker.subscribeAdminDownloads((file) => downloads.push(file));
+  try {
+    await broker.ensureWorkspace("office");
+    connection.emit("event", {
+      method: "Browser.downloadWillBegin",
+      params: { guid: "admin-download-guid-1", frameId: "administrator-frame", suggestedFilename: "report.pdf" },
+    });
+    connection.emit("event", {
+      method: "Browser.downloadProgress",
+      params: { guid: "admin-download-guid-1", state: "inProgress", receivedBytes: 10, totalBytes: 100 },
+    });
+    assert.deepEqual(downloads, []);
+    connection.emit("event", {
+      method: "Browser.downloadProgress",
+      params: { guid: "admin-download-guid-1", state: "completed", receivedBytes: 100, totalBytes: 100 },
+    });
+    assert.deepEqual(downloads, [{
+      id: "admin-download-guid-1",
+      workspaceId: null,
+      name: "report.pdf",
+      kind: "download",
+      state: "ready",
+    }]);
+  } finally {
+    unsubscribe();
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("项目导航和分享在输入发送前由网关拒绝且可返回项目首页", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-project-focus-"));
   const store = createStateStore({ file: join(directory, "state.json") });
