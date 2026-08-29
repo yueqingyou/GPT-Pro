@@ -52,8 +52,8 @@ GPT Pro 在你控制的机器上运行一份持久化 Chromium Profile。你只�
 要求：Docker 与 Compose v2。macOS、Windows 可用 Docker Desktop，Linux Docker 主机也可运行。
 
 ```bash
-git clone https://github.com/yueqingyou/GPT-Pro-Cloud.git
-cd GPT-Pro-Cloud
+git clone https://github.com/yueqingyou/GPT-Pro.git
+cd GPT-Pro
 cp .env.example .env
 # 在 .env 中替换 PUBLIC_HOST，并填写 DNSPod 专用子用户凭据
 ./scripts/up.sh

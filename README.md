@@ -52,8 +52,8 @@ administrator ─▶ /admin/maintenance/ ─▶ full KasmVNC Chromium browser
 Requirements: Docker with Compose v2. Docker Desktop works on macOS and Windows; a Linux Docker host also works.
 
 ```bash
-git clone https://github.com/yueqingyou/GPT-Pro-Cloud.git
-cd GPT-Pro-Cloud
+git clone https://github.com/yueqingyou/GPT-Pro.git
+cd GPT-Pro
 cp .env.example .env
 # Replace PUBLIC_HOST and fill in the dedicated DNSPod CAM credentials in .env
 ./scripts/up.sh
