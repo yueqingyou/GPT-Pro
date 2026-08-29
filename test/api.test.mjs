@@ -209,6 +209,11 @@ test("路径 Cookie 保持独立、显式接管旧窗口且同一页面可以自
     });
     assert.equal(officeLogin.response.status, 200);
     assert.equal(labLogin.response.status, 200);
+    const deniedOfficeLogin = await jsonRequest(base, "/w/office/login", {
+      method: "POST",
+      body: { username: "lab-user", password: "laboratory-password" },
+    });
+    assert.equal(deniedOfficeLogin.response.status, 401);
     const officeCookie = cookieOf(officeLogin.response);
     const labCookie = cookieOf(labLogin.response);
     assert.match(officeLogin.response.headers.get("set-cookie"), /Path=\/w\/office/);

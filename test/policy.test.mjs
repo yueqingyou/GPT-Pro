@@ -12,11 +12,97 @@ import {
 
 test("默认黑名单覆盖退出登录、账号设置与对应网络端点", () => {
   const policy = defaultSensitivePolicy();
-  assert.equal(sensitiveActionMatch(policy, "Open profile menu"), "profile menu");
-  assert.equal(sensitiveActionMatch(policy, "退出登录"), "退出登录");
-  assert.equal(sensitiveActionMatch(policy, "Settings"), "settings");
+  assert.equal(sensitiveActionMatch(policy, { description: "Open profile menu" }, false), "profile menu");
+  assert.equal(sensitiveActionMatch(policy, { description: "退出登录" }, false), "退出登录");
+  assert.equal(sensitiveActionMatch(policy, { description: "Settings" }, false), "settings");
   assert.match(sensitiveUrlMatch(policy, "https://chatgpt.com/api/auth/logout?return=/"), /logout/);
-  assert.equal(sensitiveActionMatch({ ...policy, enabled: false }, "退出登录"), "");
+  assert.equal(sensitiveActionMatch({ ...policy, enabled: false }, { description: "退出登录" }, false), "");
+});
+
+test("项目会话操作菜单不受账号级文字黑名单影响", () => {
+  const policy = { ...defaultSensitivePolicy(), actionPatterns: ["delete", "settings"] };
+  assert.equal(sensitiveActionMatch(policy, { description: "Delete", conversationAction: true }, true), "");
+  assert.equal(sensitiveActionMatch(policy, { description: "Delete", conversationAction: true }, false), "delete");
+  assert.equal(sensitiveActionMatch(policy, { description: "Settings", conversationAction: false }, true), "settings");
+});
+
+test("页面与输入检查按当前会话操作结构识别项目内操作", () => {
+  class FakeElement {
+    constructor(attributes, { menu = null, dialog = null, item = null } = {}) {
+      this.attributes = attributes;
+      this.menu = menu;
+      this.dialog = dialog;
+      this.item = item;
+      this.tagName = attributes.tagName || "BUTTON";
+      this.textContent = attributes.text || "";
+    }
+
+    getAttribute(name) {
+      return this.attributes[name] || null;
+    }
+
+    querySelector(selector) {
+      if (selector === '[data-testid="delete-conversation-confirm-button"]') {
+        return this.attributes.hasDeleteConfirmation ? {} : null;
+      }
+      if (selector.includes("conversation-options-button")) {
+        return this.attributes.hasConversationTrigger ? {} : null;
+      }
+      return null;
+    }
+
+    closest(selector) {
+      if (selector === '[role="menu"]') return this.menu;
+      if (selector === '[role="dialog"]') {
+        return this.attributes.role === "dialog" ? this : this.dialog;
+      }
+      if (selector === "li") return this.item;
+      if (selector === "a[href]") return null;
+      return this;
+    }
+  }
+
+  const inspect = new Function("Element", "target", `return ${sensitiveActionInspectExpression("target")};`);
+  const projectTrigger = new FakeElement({ "aria-label": "Open conversation options for Project chat" });
+  assert.equal(inspect(FakeElement, projectTrigger).conversationAction, true);
+
+  const conversationTrigger = new FakeElement({ "data-testid": "conversation-options-button" });
+  assert.equal(inspect(FakeElement, conversationTrigger).conversationAction, true);
+
+  const deleteConfirmation = new FakeElement({ "data-testid": "delete-conversation-confirm-button" });
+  assert.equal(inspect(FakeElement, deleteConfirmation).conversationAction, true);
+
+  const deleteDialog = new FakeElement({ role: "dialog", tagName: "DIV", hasDeleteConfirmation: true });
+  assert.equal(inspect(FakeElement, deleteDialog).conversationAction, true);
+
+  const cancelDelete = new FakeElement({ text: "Cancel" }, { dialog: deleteDialog });
+  assert.equal(inspect(FakeElement, cancelDelete).conversationAction, true);
+
+  const settingsDialog = new FakeElement({ role: "dialog", tagName: "DIV" });
+  assert.equal(inspect(FakeElement, settingsDialog).conversationAction, false);
+
+  const conversationItem = { querySelector: () => ({}) };
+  const conversationTitle = new FakeElement({ text: "Settings", tagName: "A" }, { item: conversationItem });
+  assert.equal(inspect(FakeElement, conversationTitle).conversationAction, true);
+
+  const titleEditor = new FakeElement({ name: "title-editor", tagName: "INPUT" }, { item: conversationItem });
+  assert.equal(inspect(FakeElement, titleEditor).conversationAction, true);
+
+  const conversationList = new FakeElement({ role: "tabpanel", tagName: "DIV", hasConversationTrigger: true });
+  assert.equal(inspect(FakeElement, conversationList).conversationAction, true);
+
+  const settingsPanel = new FakeElement({ role: "tabpanel", tagName: "DIV" });
+  assert.equal(inspect(FakeElement, settingsPanel).conversationAction, false);
+
+  const conversationMenu = { querySelector: () => ({}) };
+  const deleteAction = new FakeElement(
+    { role: "menuitem", text: "Delete", tagName: "DIV" },
+    { menu: conversationMenu },
+  );
+  assert.equal(inspect(FakeElement, deleteAction).conversationAction, true);
+
+  const accountAction = new FakeElement({ "aria-label": "Open profile menu", "data-testid": "accounts-profile-button" });
+  assert.equal(inspect(FakeElement, accountAction).conversationAction, false);
 });
 
 test("URL 通配匹配保持顺序和首尾锚定语义", () => {
@@ -34,17 +120,22 @@ test("黑名单归一化去重、限制输入并生成页面隐藏规则", () =>
   });
   assert.deepEqual(policy.actionPatterns, ["Settings", "退出登录"]);
   assert.deepEqual(policy.urlPatterns, ["*logout*"]);
-  const script = sensitiveGuardScript(policy);
+  const script = sensitiveGuardScript(policy, true);
   assert.match(script, /__gpcSensitiveGuard/);
   assert.match(script, /contenteditable/);
   assert.match(script, /role='textbox'/);
   assert.match(script, /data-gpc-sensitive-hidden/);
+  assert.match(script, /allowConversationActions/);
   assert.match(script, /MutationObserver/);
   assert.doesNotMatch(script, /preventDefault|stopImmediatePropagation|__gpcPolicyBlocked/);
   assert.doesNotThrow(() => new Function(script));
   const expression = sensitiveActionInspectExpression("target");
   assert.match(expression, /inspectSensitiveAction/);
   assert.match(expression, /target/);
+  assert.match(expression, /conversation-options-button/);
+  assert.match(expression, /Open conversation options for/);
+  assert.match(expression, /delete-chat-menu-item/);
+  assert.match(expression, /delete-conversation-confirm-button/);
   assert.doesNotMatch(expression, /__gpcSensitiveGuard/);
   assert.doesNotThrow(() => new Function(`const target = null; return ${expression};`));
   assert.throws(

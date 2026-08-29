@@ -1065,6 +1065,146 @@ class ProjectInputConnection extends FakeConnection {
   }
 }
 
+test("项目会话操作菜单绕过账号级文字黑名单但不绕过固定项目边界", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-conversation-actions-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({
+    id: "project",
+    name: "Project",
+    startUrl: "https://chatgpt.com/g/g-p-project123/project",
+  });
+  store.createWorkspace({ id: "general", name: "General", startUrl: "https://chatgpt.com/" });
+  store.setSensitivePolicy({
+    actionPatterns: [...store.sensitivePolicy().actionPatterns, "delete"],
+  });
+  const connection = new ProjectInputConnection();
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  try {
+    const runtime = await broker.ensureWorkspace("project");
+    const click = {
+      type: "pointer",
+      event: "mousePressed",
+      x: 20,
+      y: 30,
+      button: "left",
+      buttons: 1,
+    };
+    connection.action = {
+      description: "Delete delete-chat-menu-item",
+      tagName: "div",
+      role: "menuitem",
+      text: "Delete",
+      ariaLabel: "",
+      testId: "delete-chat-menu-item",
+      href: "",
+      conversationAction: true,
+    };
+    await broker.handleCommand("project", click);
+    const dispatched = connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].sessionId, runtime.sessionId);
+
+    connection.action = {
+      ...connection.action,
+      description: "Delete delete-conversation-confirm-button",
+      tagName: "button",
+      role: "",
+      testId: "delete-conversation-confirm-button",
+      conversationAction: true,
+    };
+    await broker.handleCommand("project", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 2);
+
+    await broker.handleCommand("general", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 2);
+
+    connection.action = { ...connection.action, conversationAction: false };
+    await broker.handleCommand("project", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 2);
+
+    connection.action = {
+      ...connection.action,
+      description: "Share share-chat-menu-item",
+      text: "Share",
+      testId: "share-chat-menu-item",
+      conversationAction: true,
+    };
+    await broker.handleCommand("project", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 2);
+
+    connection.action = {
+      ...connection.action,
+      description: "Other project",
+      tagName: "a",
+      role: "",
+      text: "Other project",
+      testId: "",
+      href: "https://chatgpt.com/g/g-p-other/project",
+      conversationAction: true,
+    };
+    await broker.handleCommand("project", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 2);
+  } finally {
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("更新工作区项目地址时同步页面与服务端会话操作范围", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-conversation-scope-update-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  store.createWorkspace({ id: "scope", name: "Scope", startUrl: "https://chatgpt.com/" });
+  store.setSensitivePolicy({
+    actionPatterns: [...store.sensitivePolicy().actionPatterns, "delete"],
+  });
+  const connection = new ProjectInputConnection();
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const click = {
+    type: "pointer",
+    event: "mousePressed",
+    x: 20,
+    y: 30,
+    button: "left",
+    buttons: 1,
+  };
+  connection.action = {
+    description: "Delete delete-chat-menu-item",
+    tagName: "div",
+    role: "menuitem",
+    text: "Delete",
+    ariaLabel: "",
+    testId: "delete-chat-menu-item",
+    href: "",
+    conversationAction: true,
+  };
+  try {
+    await broker.ensureWorkspace("scope");
+    const policyInstalls = () => connection.calls.filter(
+      (call) =>
+        call.method === "Page.addScriptToEvaluateOnNewDocument" &&
+        call.params.worldName === "gpc-sensitive-guard",
+    );
+    assert.match(policyInstalls().at(-1).params.source, /"allowConversationActions":false/);
+
+    const projectUrl = "https://chatgpt.com/g/g-p-project123/project";
+    store.updateWorkspace("scope", { startUrl: projectUrl });
+    await broker.navigate("scope", projectUrl);
+    assert.match(policyInstalls().at(-1).params.source, /"allowConversationActions":true/);
+    await broker.handleCommand("scope", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 1);
+
+    const generalUrl = "https://chatgpt.com/";
+    store.updateWorkspace("scope", { startUrl: generalUrl });
+    await broker.navigate("scope", generalUrl);
+    assert.match(policyInstalls().at(-1).params.source, /"allowConversationActions":false/);
+    await broker.handleCommand("scope", click);
+    assert.equal(connection.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length, 1);
+  } finally {
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 class RemoteClipboardConnection extends ProjectInputConnection {
   constructor() {
     super();
