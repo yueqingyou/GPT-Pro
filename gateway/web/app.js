@@ -1,7 +1,7 @@
 import { attachNativeTextInput, remoteModifiers, shouldForwardKey } from "./text-input.js";
 
 const app = globalThis.document?.querySelector("#app") || null;
-const IN_PAGE_NOTICE_MS = 5000;
+const PAGE_FEEDBACK_MS = 5000;
 const VIEWER_REPLACED_CLOSE_CODE = 4000;
 let adminEvents = null;
 
@@ -1034,40 +1034,47 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   );
   const canvas = node("canvas", { class: "screen", width: viewport.width, height: viewport.height, tabindex: "0" });
   const stage = node("div", { class: "screen-stage" }, canvas);
-  const notificationTitle = node("strong");
-  const notificationBody = node("span");
-  let noticeTimer = null;
-  const dismissNotice = () => {
-    clearTimeout(noticeTimer);
-    noticeTimer = null;
-    notificationNotice.hidden = true;
+  const feedbackTitle = node("strong");
+  const feedbackBody = node("span", { hidden: true });
+  let feedbackTimer = null;
+  const dismissPageFeedback = () => {
+    clearTimeout(feedbackTimer);
+    feedbackTimer = null;
+    pageFeedback.hidden = true;
     document.title = workspace.name;
   };
-  const notificationNotice = node(
+  const pageFeedback = node(
     "button",
     {
       type: "button",
-      class: "viewer-notification",
+      class: "viewer-feedback",
       hidden: true,
-      "aria-live": "assertive",
-      onClick: dismissNotice,
+      "aria-live": "polite",
+      onClick: dismissPageFeedback,
     },
-    notificationTitle,
-    notificationBody,
-    node("span", { class: "viewer-notification-close" }, "关闭"),
+    feedbackTitle,
+    feedbackBody,
+    node("span", { class: "viewer-feedback-close" }, "关闭"),
   );
-  const showInPageNotice = (title, body) => {
-    clearTimeout(noticeTimer);
-    notificationTitle.textContent = title;
-    notificationBody.textContent = body;
-    notificationNotice.hidden = false;
-    document.title = `● ${workspace.name}`;
-    noticeTimer = setTimeout(dismissNotice, IN_PAGE_NOTICE_MS);
+  const showPageFeedback = (title, body = "", state = "") => {
+    clearTimeout(feedbackTimer);
+    feedbackTitle.textContent = title;
+    feedbackBody.textContent = body;
+    feedbackBody.hidden = !body;
+    pageFeedback.dataset.state = state;
+    pageFeedback.setAttribute("aria-live", state === "error" ? "assertive" : "polite");
+    pageFeedback.hidden = false;
+    document.title = workspace.name;
+    feedbackTimer = setTimeout(dismissPageFeedback, PAGE_FEEDBACK_MS);
   };
-  const deliverNotice = (title, body) => {
+  const showNotificationFallback = (title, body, state = "") => {
+    showPageFeedback(title, body, state);
+    document.title = `● ${workspace.name}`;
+  };
+  const deliverSystemNotification = (title, body, fallbackState = "") => {
     const BrowserNotification = globalThis.Notification;
-    if (!BrowserNotification || BrowserNotification.permission !== "granted") {
-      showInPageNotice(title, body);
+    if (!globalThis.isSecureContext || !BrowserNotification || BrowserNotification.permission !== "granted") {
+      showNotificationFallback(title, body, fallbackState);
       return;
     }
     try {
@@ -1080,9 +1087,11 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
         },
         { once: true },
       );
-      systemNotice.addEventListener("error", () => showInPageNotice(title, body), { once: true });
+      systemNotice.addEventListener("error", () => showNotificationFallback(title, body, fallbackState), {
+        once: true,
+      });
     } catch {
-      showInPageNotice(title, body);
+      showNotificationFallback(title, body, fallbackState);
     }
   };
   const keyCapture = node("textarea", {
@@ -1118,7 +1127,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   const showReplacedPage = () => {
     intentionalClose = true;
     clearTimeout(reconnectTimer);
-    clearTimeout(noticeTimer);
+    dismissPageFeedback();
     document.removeEventListener("visibilitychange", sendViewerState);
     nativeInput.blur();
     replace(
@@ -1135,7 +1144,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     );
   };
 
-  const setStatus = (text, state = "") => {
+  const setConnectionStatus = (text, state = "") => {
     statusText.textContent = text;
     status.dataset.state = state;
     status.title = text;
@@ -1154,12 +1163,15 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     ) {
       return;
     }
-    BrowserNotification.requestPermission().then((permission) => {
-      setStatus(
-        permission === "granted" ? "浏览器通知已开启" : "浏览器未允许通知，将使用页面提醒",
-        permission === "granted" ? "online" : "",
-      );
-    });
+    BrowserNotification.requestPermission()
+      .then((permission) => {
+        showPageFeedback(
+          permission === "granted" ? "浏览器通知已开启" : "浏览器未允许通知",
+          permission === "granted" ? "重要异步结果将使用系统通知。" : "重要异步结果将改用页面提醒。",
+          permission === "granted" ? "success" : "",
+        );
+      })
+      .catch((error) => showPageFeedback("无法请求浏览器通知", error.message, "error"));
   };
 
   const drawNewestFrame = async (blob) => {
@@ -1175,7 +1187,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
         bitmap.close();
       }
     } catch {
-      setStatus("画面解码失败，等待下一帧…", "error");
+      showPageFeedback("画面解码失败", "正在等待下一帧…", "error");
     } finally {
       drawingFrame = false;
     }
@@ -1193,7 +1205,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     currentSocket.addEventListener("open", () => {
       if (socket !== currentSocket) return;
       reconnects = 0;
-      setStatus("已连接", "online");
+      setConnectionStatus("已连接", "online");
       const rect = stage.getBoundingClientRect();
       send({ type: "resize", width: Math.round(rect.width), height: Math.round(rect.height) });
       sendViewerState();
@@ -1208,12 +1220,15 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
           canvas.height = viewport.height;
         } else if (payload.type === "status") {
           const labels = { connected: "已连接", connecting: "正在连接浏览器…", reconnecting: "浏览器重连中…" };
-          setStatus(payload.message || labels[payload.state] || payload.state, payload.state === "connected" ? "online" : "");
+          setConnectionStatus(
+            payload.message || labels[payload.state] || payload.state,
+            payload.state === "connected" ? "online" : payload.state === "reconnecting" ? "error" : "",
+          );
         } else if (payload.type === "error") {
           if (confirmSelection && fileSelection.active) confirmSelection.disabled = !selectedUploadIds.size;
-          setStatus(payload.message || "输入失败", "error");
+          showPageFeedback("输入失败", payload.message || "", "error");
         } else if (payload.type === "policy-blocked") {
-          setStatus(payload.message || "敏感操作已拦截", "error");
+          showPageFeedback("操作已拦截", payload.message || "敏感操作已拦截", "error");
         } else if (payload.type === "file-chooser") {
           fileSelection = {
             active: true,
@@ -1221,15 +1236,15 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
             requestId: String(payload.requestId || ""),
           };
           selectedUploadIds.clear();
-          setStatus("请选择私人文件");
-          openTransferPanel(true).catch((error) => setStatus(error.message, "error"));
+          showPageFeedback("请选择私人文件");
+          openTransferPanel(true).catch((error) => showPageFeedback("无法打开私人文件", error.message, "error"));
         } else if (payload.type === "files-selected") {
           if (payload.requestId !== fileSelection.requestId) return;
           fileSelection.active = false;
           fileSelection.requestId = "";
           selectedUploadIds.clear();
           transferPanel.hidden = true;
-          setStatus(`已选择：${payload.files.map((file) => file.name).join("、")}`, "online");
+          showPageFeedback("文件选择完成", payload.files.map((file) => file.name).join("、"), "success");
           if (pointerEditable === true) nativeInput.focus();
         } else if (payload.type === "file-selection-cancelled") {
           if (payload.requestId !== fileSelection.requestId) return;
@@ -1237,18 +1252,20 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
           fileSelection.requestId = "";
           selectedUploadIds.clear();
           transferPanel.hidden = true;
-          setStatus("文件选择已取消");
+          showPageFeedback("文件选择已取消");
         } else if (payload.type === "download") {
-          refreshTransfers().catch((error) => setStatus(error.message, "error"));
+          refreshTransfers().catch((error) => showPageFeedback("无法刷新私人文件", error.message, "error"));
           if (payload.file.state === "ready") {
-            deliverNotice("下载完成", `${payload.file.name} 已保存到私人文件区`);
+            deliverSystemNotification("下载完成", `${payload.file.name} 已保存到私人文件区`, "success");
           } else if (payload.file.state === "failed") {
-            deliverNotice("下载失败", `${payload.file.name}：${payload.file.error}`);
+            deliverSystemNotification("下载失败", `${payload.file.name}：${payload.file.error}`, "error");
           }
         } else if (payload.type === "clipboard") {
-          if (!nativeInput.copyClipboardText(payload.text)) setStatus("本机浏览器拒绝写入剪贴板", "error");
+          if (!nativeInput.copyClipboardText(payload.text)) {
+            showPageFeedback("本机浏览器拒绝写入剪贴板", "", "error");
+          }
         } else if (payload.type === "notification") {
-          deliverNotice(payload.title || "ChatGPT 通知", payload.body);
+          deliverSystemNotification(payload.title || "ChatGPT 通知", payload.body);
         } else if (payload.type === "selection") {
           nativeInput.setSelectionText(payload.text);
         } else if (payload.type === "input-target" && payload.sequence === pointerSequence) {
@@ -1269,7 +1286,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
         return;
       }
       if (intentionalClose) return;
-      setStatus("连接中断，正在重试…", "error");
+      setConnectionStatus("连接中断，正在重试…", "error");
       reconnects += 1;
       if (reconnects >= 3) {
         try {
@@ -1279,7 +1296,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
             return;
           }
         } catch (error) {
-          setStatus(`连接中断，状态检查失败：${error.message}`, "error");
+          setConnectionStatus(`连接中断，状态检查失败：${error.message}`, "error");
         }
       }
       reconnectTimer = setTimeout(connect, Math.min(5000, 700 * reconnects));
@@ -1375,12 +1392,12 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   const selectedLocalText = () =>
     keyCapture.value.slice(keyCapture.selectionStart || 0, keyCapture.selectionEnd || 0);
   keyCapture.addEventListener("copy", () => {
-    if (selectedLocalText()) setStatus("已复制到本机剪贴板", "online");
+    if (selectedLocalText()) showPageFeedback("已复制到本机剪贴板", "", "success");
   });
   keyCapture.addEventListener("cut", () => {
     if (!selectedLocalText()) return;
     const sent = send({ type: "cut" });
-    setStatus(sent ? "已剪切到本机剪贴板" : "工作区连接尚未恢复", sent ? "online" : "error");
+    showPageFeedback(sent ? "已剪切到本机剪贴板" : "工作区连接尚未恢复", "", sent ? "success" : "error");
   });
   keyCapture.addEventListener("keydown", (event) => {
     if (!shouldForwardKey(event)) return;
@@ -1454,7 +1471,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
         uploadIds: [...selectedUploadIds],
       })) {
         confirmSelection.disabled = false;
-        setStatus("工作区连接尚未恢复", "error");
+        showPageFeedback("工作区连接尚未恢复", "", "error");
       }
     },
   });
@@ -1466,7 +1483,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       fileSelection.requestId = "";
       selectedUploadIds.clear();
       send({ type: "cancelFileSelection", requestId });
-      setStatus("文件选择已取消");
+      showPageFeedback("文件选择已取消");
     }
     if (pointerEditable === true) nativeInput.focus();
   };
@@ -1526,7 +1543,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
             selectedUploadIds.delete(file.id);
             await refreshTransfers();
           } catch (error) {
-            setStatus(error.message, "error");
+            showPageFeedback("删除失败", error.message, "error");
           }
         },
       });
@@ -1600,17 +1617,17 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       for (let index = 0; index < files.length; index += 1) {
         const file = files[index];
         const result = await uploadFile(`/w/${workspace.id}/api/uploads`, file, ({ loaded, total, ratio }) => {
-          setStatus(
-            `上传 ${index + 1}/${files.length}：${file.name} · ${formatBytes(loaded)} / ${formatBytes(total)} · ${Math.round(ratio * 100)}%`,
-            "online",
+          showPageFeedback(
+            "正在上传",
+            `${index + 1}/${files.length}：${file.name} · ${formatBytes(loaded)} / ${formatBytes(total)} · ${Math.round(ratio * 100)}%`,
           );
         });
         uploaded.push(result.file);
       }
-      setStatus(`已保存到私人文件区：${uploaded.length} 个文件`, "online");
+      showPageFeedback("上传完成", `已保存到私人文件区：${uploaded.length} 个文件`, "success");
       await openTransferPanel(false);
     } catch (error) {
-      setStatus(error.message, "error");
+      showPageFeedback("上传失败", error.message, "error");
     } finally {
       upload.disabled = !fileTransfer.enabled;
     }
@@ -1619,7 +1636,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
   const downloads = button("查看文件", {
     class: "button small ghost",
     disabled: !fileTransfer.enabled,
-    onClick: () => openTransferPanel(false).catch((error) => setStatus(error.message, "error")),
+    onClick: () => openTransferPanel(false).catch((error) => showPageFeedback("无法打开私人文件", error.message, "error")),
   });
 
   const startParts = new URL(workspace.startUrl).pathname.split("/").filter(Boolean);
@@ -1633,7 +1650,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
           "aria-label": "项目首页",
           onClick: () => {
             if (!send({ type: "projectHome" })) {
-              setStatus("工作区连接尚未恢复", "error");
+              showPageFeedback("工作区连接尚未恢复", "", "error");
               return;
             }
             if (!transferPanel.hidden) closeTransferPanel();
@@ -1650,13 +1667,15 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
       class: "viewer-toolbar-button viewer-reload-button",
       title: "刷新页面",
       "aria-label": "刷新页面",
-      onClick: () => send({ type: "reload" }),
+      onClick: () => {
+        if (!send({ type: "reload" })) showPageFeedback("工作区连接尚未恢复", "", "error");
+      },
     },
     toolbarIcon(["M21 12a9 9 0 0 0-15-6.7L3 8", "M3 3v5h5", "M3 12a9 9 0 0 0 15 6.7l3-2.7", "M16 16h5v5"]),
   );
   const fullscreen = button("进入全屏", {
     class: "button small ghost",
-    onClick: () => app.requestFullscreen().catch((error) => setStatus(error.message, "error")),
+    onClick: () => app.requestFullscreen().catch((error) => showPageFeedback("无法进入全屏", error.message, "error")),
   });
   const logout = button("退出登录", {
     class: "button small ghost",
@@ -1667,7 +1686,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
         socket?.close();
         location.reload();
       } catch (error) {
-        setStatus(error.message, "error");
+        showPageFeedback("退出登录失败", error.message, "error");
       }
     },
   });
@@ -1783,7 +1802,7 @@ function renderViewer(workspace, fileTransfer = { enabled: false }) {
     "div",
     { class: "viewer" },
     stage,
-    notificationNotice,
+    pageFeedback,
     toolbar,
     keyCapture,
   );

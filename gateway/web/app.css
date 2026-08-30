@@ -882,11 +882,11 @@ a {
   cursor: default;
 }
 
-.viewer-notification {
+.viewer-feedback {
   position: fixed;
   z-index: 41;
   top: 14px;
-  right: 14px;
+  left: 50%;
   display: grid;
   width: min(420px, calc(100vw - 28px));
   min-width: 0;
@@ -899,9 +899,15 @@ a {
   cursor: pointer;
   padding: 11px 64px 11px 13px;
   text-align: left;
+  transform: translateX(-50%);
 }
 
-.viewer-notification strong {
+.viewer-feedback[data-state="error"] {
+  border-color: #efc2bd;
+  background: rgb(255 247 245 / 98%);
+}
+
+.viewer-feedback strong {
   overflow: hidden;
   font-size: 0.82rem;
   font-weight: 600;
@@ -909,13 +915,13 @@ a {
   white-space: nowrap;
 }
 
-.viewer-notification > span:not(.viewer-notification-close) {
+.viewer-feedback > span:not(.viewer-feedback-close) {
   color: var(--muted);
   font-size: 0.74rem;
   overflow-wrap: anywhere;
 }
 
-.viewer-notification-close {
+.viewer-feedback-close {
   position: absolute;
   top: 50%;
   right: 13px;
@@ -923,6 +929,10 @@ a {
   font-size: 0.72rem;
   font-weight: 600;
   transform: translateY(-50%);
+}
+
+.viewer-feedback[data-state="error"] .viewer-feedback-close {
+  color: var(--danger);
 }
 
 .viewer-toolbar {
@@ -1191,6 +1201,11 @@ a {
 }
 
 @media (max-width: 560px) {
+  .viewer-feedback {
+    top: auto;
+    bottom: 14px;
+  }
+
   .page-shell {
     width: min(100% - 24px, 1120px);
     padding-top: 10px;
