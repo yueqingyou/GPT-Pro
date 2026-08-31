@@ -156,7 +156,8 @@ test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件
   assert.match(focus, /Show project details/);
   assert.match(focus, /move to project/);
   assert.match(focus, /remove from project/);
-  assert.match(policy, /data-gpc-sensitive-hidden/);
+  assert.match(policy, /data-gpc-sensitive-control-hidden/);
+  assert.doesNotMatch(policy, /data-gpc-sensitive-hidden/);
   assert.doesNotMatch(focus, /stopImmediatePropagation|preventDefault/);
   assert.doesNotMatch(policy, /stopImmediatePropagation|preventDefault/);
   const client = read("gateway/web/app.js");

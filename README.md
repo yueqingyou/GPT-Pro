@@ -139,6 +139,7 @@ Current limitations:
 - rich-text, image and file clipboard formats are not mirrored; selections and ChatGPT message-copy buttons transfer plain text only;
 - audio, microphone and ChatGPT voice mode are not streamed;
 - different users connected to the same workspace share one viewport;
+- all workspace Targets and the administrator browser share one Chromium BrowserContext, Profile, ChatGPT identity and site storage. CDP input remains scoped to its Target, but the gateway does not isolate an unsent draft that ChatGPT itself saves or restores across windows;
 - continuous Chromium streams still consume shared rendering, JPEG encoding, CPU, RAM and bandwidth; visible viewers use `FRAME_ACTIVE_FPS`, and hiding a page stops its stream;
 - notifications relay only while the ordinary page remains open and connected; closed pages and offline devices receive no backlog;
 - configured FPS is a sampling and delivery ceiling rather than a delivered-rate guarantee; shared Chromium rendering and encoding remain the limit when many pages change together;

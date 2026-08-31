@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import vm from "node:vm";
 import {
   defaultSensitivePolicy,
   normalizeSensitivePolicy,
@@ -166,7 +167,8 @@ test("黑名单归一化去重、限制输入并生成页面隐藏规则", () =>
   assert.match(script, /__gpcSensitiveGuard/);
   assert.match(script, /contenteditable/);
   assert.match(script, /role='textbox'/);
-  assert.match(script, /data-gpc-sensitive-hidden/);
+  assert.match(script, /data-gpc-sensitive-control-hidden/);
+  assert.doesNotMatch(script, /data-gpc-sensitive-hidden/);
   assert.match(script, /allowConversationActions/);
   assert.match(script, /MutationObserver/);
   assert.doesNotMatch(script, /preventDefault|stopImmediatePropagation|__gpcPolicyBlocked/);
@@ -184,4 +186,56 @@ test("黑名单归一化去重、限制输入并生成页面隐藏规则", () =>
     () => normalizeSensitivePolicy({ enabled: true, actionPatterns: ["x".repeat(181)], urlPatterns: [] }),
     /不能超过/,
   );
+});
+
+test("重新注入会停用旧守卫并替换当前实现", () => {
+  const disabledPolicies = [];
+  const readyCallbacks = [];
+  const previous = {
+    update(policy) {
+      disabledPolicies.push(policy);
+    },
+  };
+  const context = vm.createContext({
+    __gpcSensitiveGuard: previous,
+    addEventListener(type, callback) {
+      if (type === "DOMContentLoaded") readyCallbacks.push(callback);
+    },
+    document: {
+      documentElement: null,
+      querySelector() {
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+    },
+    Element: class {},
+    MutationObserver: class {},
+    queueMicrotask,
+  });
+  const script = sensitiveGuardScript(defaultSensitivePolicy(), true);
+
+  vm.runInContext(script, context);
+  assert.equal(disabledPolicies.length, 1);
+  assert.equal(disabledPolicies[0].enabled, false);
+  assert.equal(disabledPolicies[0].actionPatterns.length, 0);
+  assert.notEqual(context.__gpcSensitiveGuard, previous);
+  assert.deepEqual(Object.keys(context.__gpcSensitiveGuard).sort(), ["dispose", "update"]);
+  assert.equal(readyCallbacks.length, 1);
+
+  const installed = context.__gpcSensitiveGuard;
+  let disposed = 0;
+  const dispose = installed.dispose;
+  installed.dispose = () => {
+    disposed += 1;
+    dispose();
+  };
+  vm.runInContext(script, context);
+  assert.equal(disposed, 1);
+  assert.notEqual(context.__gpcSensitiveGuard, installed);
+  assert.deepEqual(Object.keys(context.__gpcSensitiveGuard).sort(), ["dispose", "update"]);
+  assert.equal(readyCallbacks.length, 2);
+  context.document.documentElement = {};
+  assert.doesNotThrow(() => readyCallbacks[0]());
 });
