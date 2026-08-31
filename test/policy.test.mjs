@@ -44,6 +44,7 @@ test("页面与输入检查按控件语义识别会话操作与编辑器正文",
     }
 
     querySelector(selector) {
+      if (selector.includes("[contenteditable]") && this.attributes.hasEditableDescendant) return {};
       if (selector === '[data-testid="delete-conversation-confirm-button"]') {
         return this.attributes.hasDeleteConfirmation ? {} : null;
       }
@@ -134,6 +135,29 @@ test("页面与输入检查按控件语义识别会话操作与编辑器正文",
   assert.equal(composerAction.text, "");
   assert.equal(composerAction.description, "Message ChatGPT");
   assert.equal(sensitiveActionMatch(defaultSensitivePolicy(), composerAction, true), "");
+
+  const composerContainer = new FakeElement({
+    tagName: "MAIN",
+    tabindex: "-1",
+    text: pastedText,
+    hasEditableDescendant: true,
+  });
+  const containerAction = inspect(FakeElement, composerContainer);
+  assert.equal(containerAction.text, "");
+  assert.equal(containerAction.description, "");
+  assert.equal(sensitiveActionMatch(defaultSensitivePolicy(), containerAction, true), "");
+
+  const settingsContainer = new FakeElement({
+    tagName: "MAIN",
+    tabindex: "-1",
+    text: pastedText,
+    "aria-label": "Settings",
+    hasEditableDescendant: true,
+  });
+  const settingsContainerAction = inspect(FakeElement, settingsContainer);
+  assert.equal(settingsContainerAction.text, "");
+  assert.equal(settingsContainerAction.description, "Settings");
+  assert.equal(sensitiveActionMatch(defaultSensitivePolicy(), settingsContainerAction, true), "settings");
 
   const settingsEditor = new FakeElement({
     role: "textbox",
