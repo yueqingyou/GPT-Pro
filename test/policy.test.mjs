@@ -26,7 +26,7 @@ test("项目会话操作菜单不受账号级文字黑名单影响", () => {
   assert.equal(sensitiveActionMatch(policy, { description: "Settings", conversationAction: false }, true), "settings");
 });
 
-test("页面与输入检查按当前会话操作结构识别项目内操作", () => {
+test("页面与输入检查按控件语义识别会话操作与编辑器正文", () => {
   class FakeElement {
     constructor(attributes, { menu = null, dialog = null, item = null } = {}) {
       this.attributes = attributes;
@@ -35,6 +35,7 @@ test("页面与输入检查按当前会话操作结构识别项目内操作", ()
       this.item = item;
       this.tagName = attributes.tagName || "BUTTON";
       this.textContent = attributes.text || "";
+      this.isContentEditable = attributes.contenteditable === "true";
     }
 
     getAttribute(name) {
@@ -103,6 +104,47 @@ test("页面与输入检查按当前会话操作结构识别项目内操作", ()
 
   const accountAction = new FakeElement({ "aria-label": "Open profile menu", "data-testid": "accounts-profile-button" });
   assert.equal(inspect(FakeElement, accountAction).conversationAction, false);
+
+  const pastedText = `标题在稿件和提交材料中保持统一
+
+与商业LLM的比较措辞需要更谨慎(因为这些模型是在零样本设置下评估的)(没看懂为什么说需要谨慎)
+
+检查标题、术语、数据集名称、图注和表格数值的一致性
+
+确保数据可用性声明中提及的所有代码、脚本、提示词、配置文件和数据处理说明均可访问
+
+明确说明重复的DFPO结果是基于同一检查点的重复推理，而非独立的训练运行
+
+阐明“最佳F1”和最优演示数量是如何选择的
+
+进行最终的语言和校对检查
+
+
+
+附上一份单独上传的“回复审稿人”文件 Submit Revision,逐点详细回应本信中提出的问题`;
+  const composer = new FakeElement({
+    role: "textbox",
+    contenteditable: "true",
+    tagName: "DIV",
+    text: pastedText,
+    "aria-label": "Message ChatGPT",
+  });
+  const composerAction = inspect(FakeElement, composer);
+  assert.equal(composerAction.text, "");
+  assert.equal(composerAction.description, "Message ChatGPT");
+  assert.equal(sensitiveActionMatch(defaultSensitivePolicy(), composerAction, true), "");
+
+  const settingsEditor = new FakeElement({
+    role: "textbox",
+    contenteditable: "true",
+    tagName: "DIV",
+    text: pastedText,
+    "aria-label": "Settings",
+  });
+  assert.equal(sensitiveActionMatch(defaultSensitivePolicy(), inspect(FakeElement, settingsEditor), true), "settings");
+
+  const settingsButton = new FakeElement({ text: "Settings" });
+  assert.equal(sensitiveActionMatch(defaultSensitivePolicy(), inspect(FakeElement, settingsButton), true), "settings");
 });
 
 test("URL 通配匹配保持顺序和首尾锚定语义", () => {
