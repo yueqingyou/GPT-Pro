@@ -104,7 +104,7 @@ test("Portal IPC 连接关闭会撤销对应工作区请求", async () => {
   }
 });
 
-test("Gateway 通过独立桌面 IPC 请求精确窗口标记", async () => {
+test("Gateway 通过独立桌面 IPC 请求精确窗口标记与管理员窗口聚焦", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-portal-tag-"));
   const desktopSocket = join(directory, "desktop.sock");
   const messages = [];
@@ -127,9 +127,11 @@ test("Gateway 通过独立桌面 IPC 请求精确窗口标记", async () => {
   try {
     await bridge.tagWorkspace({ title: "unique - Chromium", workspaceId: "office" });
     await bridge.tagAdministrator();
+    await bridge.focusAdministrator();
     assert.deepEqual(messages, [
       { type: "tag-workspace", title: "unique - Chromium", workspaceId: "office" },
       { type: "tag-administrator" },
+      { type: "focus-administrator" },
     ]);
   } finally {
     await new Promise((resolve) => desktop.close(resolve));

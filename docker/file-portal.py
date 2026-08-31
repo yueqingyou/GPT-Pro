@@ -13,7 +13,7 @@ import dbus
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
-from Xlib import X, display, error
+from Xlib import X, display, error, protocol
 
 BACKEND_NAME = "org.freedesktop.impl.portal.desktop.gpc"
 GTK_BACKEND_NAME = "org.freedesktop.impl.portal.desktop.gtk"
@@ -140,6 +140,34 @@ class WindowRouter:
                 if len(untagged) != 1:
                     raise ValueError("无法唯一定位管理员窗口")
                 self._set(connection, untagged[0], kind, "administrator")
+                connection.sync()
+            finally:
+                connection.close()
+
+    def focus_administrator(self):
+        with self.lock:
+            connection = display.Display()
+            try:
+                kind = connection.intern_atom("_GPC_WINDOW_KIND")
+                administrators = [
+                    window
+                    for window in self._windows(connection)
+                    if self._is_chromium(window)
+                    and self._text(window, kind) == "administrator"
+                ]
+                if len(administrators) != 1:
+                    raise ValueError("无法唯一定位管理员窗口")
+                root = connection.screen().root
+                active_window = connection.intern_atom("_NET_ACTIVE_WINDOW")
+                event = protocol.event.ClientMessage(
+                    window=administrators[0],
+                    client_type=active_window,
+                    data=(32, [1, X.CurrentTime, 0, 0, 0]),
+                )
+                root.send_event(
+                    event,
+                    event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+                )
                 connection.sync()
             finally:
                 connection.close()
@@ -477,10 +505,10 @@ class ControlServer(threading.Thread):
                     while b"\n" not in buffer:
                         chunk = connection.recv(4096)
                         if not chunk:
-                            raise ValueError("窗口标记请求不完整")
+                            raise ValueError("桌面控制请求不完整")
                         buffer += chunk
                         if len(buffer) > MAX_MESSAGE_BYTES:
-                            raise ValueError("窗口标记请求过大")
+                            raise ValueError("桌面控制请求过大")
                     message = json.loads(buffer.split(b"\n", 1)[0])
                     if message.get("type") == "tag-workspace":
                         self.router.tag_workspace(
@@ -489,8 +517,10 @@ class ControlServer(threading.Thread):
                         )
                     elif message.get("type") == "tag-administrator":
                         self.router.tag_administrator()
+                    elif message.get("type") == "focus-administrator":
+                        self.router.focus_administrator()
                     else:
-                        raise ValueError("未知窗口标记请求")
+                        raise ValueError("未知桌面控制请求")
                     response = {"ok": True}
                 except (
                     ValueError,

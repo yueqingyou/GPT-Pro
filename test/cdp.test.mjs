@@ -108,6 +108,8 @@ class FakePortal extends EventEmitter {
     super();
     this.workspaceTags = [];
     this.administratorTags = 0;
+    this.administratorFocuses = 0;
+    this.administratorActions = [];
     this.selections = [];
     this.cancellations = [];
   }
@@ -118,6 +120,12 @@ class FakePortal extends EventEmitter {
 
   async tagAdministrator() {
     this.administratorTags += 1;
+    this.administratorActions.push("tag");
+  }
+
+  async focusAdministrator() {
+    this.administratorFocuses += 1;
+    this.administratorActions.push("focus");
   }
 
   select(requestId, paths) {
@@ -274,6 +282,28 @@ class DiscoveryConnection extends FakeConnection {
       };
     }
     return {};
+  }
+}
+
+class PausedDiscoveryConnection extends DiscoveryConnection {
+  constructor(markers) {
+    super(markers);
+    this.discoveryStarted = new Promise((resolve) => {
+      this.resolveDiscoveryStarted = resolve;
+    });
+    this.discoveryRelease = new Promise((resolve) => {
+      this.resolveDiscoveryRelease = resolve;
+    });
+    this.discoveryPaused = false;
+  }
+
+  async call(method, params = {}, sessionId) {
+    if (method === "Target.getTargets" && !this.discoveryPaused) {
+      this.discoveryPaused = true;
+      this.resolveDiscoveryStarted();
+      await this.discoveryRelease;
+    }
+    return super.call(method, params, sessionId);
   }
 }
 
@@ -703,6 +733,12 @@ test("多窗口本机粘贴经远端原生粘贴事务全局顺序提交", async
       (call) => call.method === "Input.dispatchKeyEvent" && call.params.commands?.[0] === "Paste",
     );
     assert.equal(paste.length, 2);
+    assert.deepEqual(
+      connection.calls
+        .filter((call) => call.method === "Emulation.setFocusEmulationEnabled")
+        .map((call) => call.params.enabled),
+      [true, false, true, false],
+    );
   } finally {
     broker.stop();
     rmSync(directory, { recursive: true, force: true });
@@ -814,22 +850,31 @@ test("网关重启后通过每窗口 sessionStorage 认领 Target 而不重复�
   }
 });
 
-test("管理员浏览器置前且普通窗口恢复时不再覆盖", async () => {
+test("管理员窗口按桌面标记置前且普通窗口恢复时不再覆盖", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-maintenance-"));
   const store = createStateStore({ file: join(directory, "state.json") });
   store.createWorkspace({ id: "office", name: "Office", startUrl: "https://chatgpt.com/" });
   const markers = new Map([["office-target", "office"]]);
-  const connection = new DiscoveryConnection(markers);
-  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const reconnectConnection = new PausedDiscoveryConnection(markers);
+  const connections = [new DiscoveryConnection(markers), reconnectConnection];
+  let connectionIndex = 0;
+  const broker = new WorkspaceBroker({
+    store,
+    connect: async () => connections[connectionIndex++],
+    logger: { warn() {}, error() {} },
+  });
+  const connection = connections[0];
   const viewer = { readyState: 1, bufferedAmount: 0, send() {}, close() {} };
   try {
     await broker.ensureWorkspace("office");
     await broker.setMaintenanceActive(true);
     assert.equal(broker.status().maintenanceActive, true);
     await broker.addViewer("office", viewer);
-    const focusCalls = connection.calls.filter((call) => call.method === "Page.bringToFront");
-    assert.ok(focusCalls.length >= 2);
-    assert.ok(focusCalls.every((call) => call.sessionId === "session-maintenance"));
+    assert.equal(broker.portal.administratorFocuses, 2);
+    assert.equal(connection.calls.some((call) => call.method === "Page.bringToFront"), false);
+    const focusesBeforeResize = broker.portal.administratorFocuses;
+    await broker.handleCommand("office", { type: "resize", width: 1024, height: 768 }, null, viewer);
+    assert.equal(broker.portal.administratorFocuses, focusesBeforeResize + 1);
     connection.emit("event", {
       method: "Target.targetCreated",
       params: { targetInfo: { targetId: "ordinary-popup", type: "page", openerId: "office-target" } },
@@ -847,6 +892,17 @@ test("管理员浏览器置前且普通窗口恢复时不再覆盖", async () =>
         (call) => call.method === "Target.closeTarget" && call.params.targetId === "copied-workspace",
       ),
     );
+    const focusesBeforeReconnect = broker.portal.administratorFocuses;
+    connection.open = false;
+    connection.emit("disconnect", new Error("browser restarted"));
+    const reconnect = broker.ensureWorkspace("office");
+    await reconnectConnection.discoveryStarted;
+    const concurrentFocus = broker.focusMaintenance();
+    reconnectConnection.resolveDiscoveryRelease();
+    await Promise.all([reconnect, concurrentFocus]);
+    assert.equal(broker.portal.administratorFocuses, focusesBeforeReconnect + 1);
+    assert.deepEqual(broker.portal.administratorActions.slice(-2), ["tag", "focus"]);
+    assert.equal(connections[1].calls.some((call) => call.method === "Page.bringToFront"), false);
     await broker.setMaintenanceActive(false);
     assert.equal(broker.status().maintenanceActive, false);
   } finally {
@@ -1298,11 +1354,93 @@ test("十二窗口短间隔原生复制按远端系统剪贴板全局顺序定�
     );
     assert.equal(clipboardEvaluations.length, 24);
     assert.ok(clipboardEvaluations.every((call) => Number.isInteger(call.params.contextId)));
+    assert.deepEqual(
+      connection.calls
+        .filter((call) => call.method === "Emulation.setFocusEmulationEnabled")
+        .map((call) => call.params.enabled),
+      Array.from({ length: 12 }, () => [true, false]).flat(),
+    );
     for (let index = 0; index < viewers.length; index += 1) {
       const clipboard = viewers[index].messages.filter((message) => message.type === "clipboard");
       assert.deepEqual(clipboard, [{ type: "clipboard", text: `clipboard:project-focus-session-project-focus-target-${index + 2}` }]);
     }
   } finally {
+    broker.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("管理员审查中普通粘贴、消息复制与项目首页不切换桌面窗口", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-maintenance-clipboard-"));
+  const store = createStateStore({ file: join(directory, "state.json") });
+  const projectUrl = "https://chatgpt.com/g/g-p-project123/project";
+  store.createWorkspace({ id: "project", name: "Project", startUrl: projectUrl });
+  const connection = new RemoteClipboardConnection();
+  connection.action = {
+    description: "Copy response",
+    tagName: "button",
+    ariaLabel: "Copy response",
+    testId: "copy-turn-action-button",
+    href: "",
+  };
+  const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
+  const viewer = {
+    readyState: 1,
+    bufferedAmount: 0,
+    messages: [],
+    send(payload, options = {}) {
+      if (!options.binary) this.messages.push(JSON.parse(payload));
+    },
+    close() {
+      this.readyState = 3;
+    },
+  };
+  try {
+    await broker.addViewer("project", viewer);
+    const runtime = broker.runtimes.get("project");
+    await broker.setMaintenanceActive(true);
+    const maintenanceFocuses = broker.portal.administratorFocuses;
+
+    await broker.handleCommand("project", { type: "text", text: "论文小修需要怎么改？", paste: true }, null, viewer);
+    assert.equal(broker.portal.administratorFocuses, maintenanceFocuses + 1);
+    await broker.handleCommand("project", { type: "projectHome" }, null, viewer);
+    assert.equal(broker.portal.administratorFocuses, maintenanceFocuses + 1);
+    await broker.handleCommand(
+      "project",
+      { type: "pointer", event: "mouseReleased", x: 20, y: 30, button: "left", buttons: 0, clickCount: 1 },
+      null,
+      viewer,
+    );
+
+    assert.equal(broker.portal.administratorFocuses, maintenanceFocuses + 2);
+    assert.equal(connection.calls.some((call) => call.method === "Page.bringToFront"), false);
+    assert.deepEqual(
+      connection.calls
+        .filter((call) => call.method === "Emulation.setFocusEmulationEnabled")
+        .map((call) => call.params.enabled),
+      [true, false, true, false],
+    );
+    assert.ok(
+      connection.calls.some(
+        (call) =>
+          call.method === "Input.dispatchKeyEvent" &&
+          call.sessionId === runtime.sessionId &&
+          call.params.commands?.[0] === "Paste",
+      ),
+    );
+    assert.ok(
+      connection.calls.some(
+        (call) =>
+          call.method === "Page.navigate" && call.sessionId === runtime.sessionId && call.params.url === projectUrl,
+      ),
+    );
+    assert.deepEqual(
+      viewer.messages.filter((message) => message.type === "clipboard"),
+      [{ type: "clipboard", text: `clipboard:${runtime.sessionId}` }],
+    );
+    assert.equal(viewer.messages.some((message) => message.type === "policy-blocked"), false);
+  } finally {
+    broker.removeViewer("project", viewer);
     broker.stop();
     rmSync(directory, { recursive: true, force: true });
   }

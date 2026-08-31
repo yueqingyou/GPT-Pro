@@ -93,6 +93,8 @@ test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件
   assert.match(cdp, /Input\.insertText/);
   assert.match(cdp, /sessionId/);
   assert.match(cdp, /Target\.createTarget/);
+  assert.doesNotMatch(cdp, /Page\.bringToFront/);
+  assert.match(cdp, /Emulation\.setFocusEmulationEnabled/);
   assert.match(cdp, /gpc\.workspaceId/);
   assert.match(cdp, /sessionStorage\.setItem/);
   assert.match(cdp, /Emulation\.setTimezoneOverride/);
@@ -116,8 +118,12 @@ test("网关通过 CDP sessionId 定向输入并通过原生 Portal 选择文件
   assert.match(read("gateway/server.mjs"), /\/run\/gpc\/gateway\.sock/);
   assert.match(read("gateway/server.mjs"), /\/run\/gpc\/desktop\.sock/);
   assert.match(portal, /tagWorkspace/);
-  assert.match(read("docker/file-portal.py"), /org\.freedesktop\.impl\.portal\.FileChooser/);
-  assert.match(read("docker/file-portal.py"), /_GPC_WORKSPACE_ID/);
+  assert.match(portal, /focusAdministrator/);
+  const desktopPortal = read("docker/file-portal.py");
+  assert.match(desktopPortal, /org\.freedesktop\.impl\.portal\.FileChooser/);
+  assert.match(desktopPortal, /_GPC_WORKSPACE_ID/);
+  assert.match(desktopPortal, /focus-administrator/);
+  assert.match(desktopPortal, /_NET_ACTIVE_WINDOW/);
   assert.match(read("docker/gptpro-portals.conf"), /FileChooser=gpc/);
   assert.match(cdp, /Browser\.setDownloadBehavior/);
   assert.match(cdp, /Page\.startScreencast/);
