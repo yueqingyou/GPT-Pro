@@ -1298,7 +1298,7 @@ class RemoteClipboardConnection extends ProjectInputConnection {
   }
 }
 
-test("十二窗口短间隔原生复制按远端系统剪贴板全局顺序定向返回", async () => {
+test("十二窗口短间隔文本卡片复制按远端系统剪贴板全局顺序定向返回", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gpc-cdp-remote-clipboard-"));
   const store = createStateStore({ file: join(directory, "state.json") });
   const workspaceIds = Array.from({ length: 12 }, (_, index) => `copy-${index + 1}`);
@@ -1307,11 +1307,12 @@ test("十二窗口短间隔原生复制按远端系统剪贴板全局顺序定�
   }
   const connection = new RemoteClipboardConnection();
   connection.action = {
-    description: "Copy response",
+    description: "Copy",
     tagName: "button",
-    ariaLabel: "Copy response",
-    testId: "copy-turn-action-button",
+    ariaLabel: "Copy",
+    testId: "",
     href: "",
+    writingBlockCopy: true,
   };
   const broker = new WorkspaceBroker({ store, connect: async () => connection, logger: { warn() {}, error() {} } });
   const viewers = workspaceIds.map(() => ({
@@ -1354,6 +1355,13 @@ test("十二窗口短间隔原生复制按远端系统剪贴板全局顺序定�
     );
     assert.equal(clipboardEvaluations.length, 24);
     assert.ok(clipboardEvaluations.every((call) => Number.isInteger(call.params.contextId)));
+    assert.ok(
+      connection.calls.some(
+        (call) =>
+          call.method === "Runtime.evaluate" &&
+          call.params.expression.includes('[data-testid="writing-block-header-surface"]'),
+      ),
+    );
     assert.deepEqual(
       connection.calls
         .filter((call) => call.method === "Emulation.setFocusEmulationEnabled")
@@ -1364,6 +1372,15 @@ test("十二窗口短间隔原生复制按远端系统剪贴板全局顺序定�
       const clipboard = viewers[index].messages.filter((message) => message.type === "clipboard");
       assert.deepEqual(clipboard, [{ type: "clipboard", text: `clipboard:project-focus-session-project-focus-target-${index + 2}` }]);
     }
+
+    connection.action = { ...connection.action, writingBlockCopy: false };
+    await broker.handleCommand(
+      workspaceIds[0],
+      { type: "pointer", event: "mouseReleased", x: 20, y: 30, button: "left", buttons: 0, clickCount: 1 },
+      null,
+      viewers[0],
+    );
+    assert.equal(viewers[0].messages.filter((message) => message.type === "clipboard").length, 1);
   } finally {
     broker.stop();
     rmSync(directory, { recursive: true, force: true });
